@@ -23,9 +23,9 @@ shared_data = {
     'latest_back_frame': None,
     'steering_input' : 0.0,
     'acceleration_input' : 1.0,
-    'tap_state': 'IDLE',        
-    'debug_info': "WAITING",  
-    'debug_tokens': [],        
+    'tap_state': 'IDLE', 
+    'debug_info': "WAITING",
+    'debug_tokens': [], 
     'net_lane_position': 0 
 }
 data_lock = threading.Lock()
@@ -242,9 +242,11 @@ def detect_environment(front_frame):
     mask_red1 = cv2.inRange(roi_hsv, np.array([0, 120, 70]), np.array([10, 255, 255]))
     mask_red2 = cv2.inRange(roi_hsv, np.array([170, 120, 70]), np.array([180, 255, 255]))
     mask_red = mask_red1 | mask_red2
-    
+    mask_yellow = cv2.inRange(roi_hsv, np.array([15, 100, 100]), np.array([35, 255, 255]))
+
     contours_g, _ = cv2.findContours(mask_green, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     contours_red, _ = cv2.findContours(mask_red, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contours_yellow, _ = cv2.findContours(mask_yellow, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
     detected_objects = []
     debug_tokens = []
@@ -259,6 +261,17 @@ def detect_environment(front_frame):
                     dist = (y + h/2 + ROI_START_Y) - 80
                     detected_objects.append({'type': 'DANGER', 'lanes': lanes, 'dist': dist})
                     debug_tokens.append(('DANGER_RED', x*2, (y+ROI_START_Y)*2, w*2, h*2))
+
+    for c in contours_yellow:
+        area = cv2.contourArea(c)
+        if area > 5:
+            x, y, w, h = cv2.boundingRect(c)
+            if 0.3 < float(w)/h < 3.0:
+                lanes = get_occupied_lanes(x, y, w, h)
+                if lanes:
+                    dist = (y + h/2 + ROI_START_Y) - 80
+                    detected_objects.append({'type': 'DANGER', 'lanes': lanes, 'dist': dist})
+                    debug_tokens.append(('DANGER_YELLOW', x*2, (y+ROI_START_Y)*2, w*2, h*2))
     
     for c in contours_g:
         area = cv2.contourArea(c)
@@ -273,18 +286,70 @@ def detect_environment(front_frame):
                     
     return detected_objects, debug_tokens
 
+def evaluate_decision(detected_objects, current_lane):
+    target_steer = 0.0
+    debug_text = "CRUISING"
+
+    danger_lanes = set()
+    green_lanes = set()
+
+    for obj in detected_objects:
+        if obj['type'] == 'DANGER':
+            for lane in obj['lanes']: danger_lanes.add(lane)
+        elif obj['type'] == 'GREEN':
+            for lane in obj['lanes']: green_lanes.add(lane)
+
+    if 0 in danger_lanes:
+        if -1 not in danger_lanes:
+            target_steer = -1.0
+            debug_text = "<< EVADE LEFT"
+        elif 1 not in danger_lanes:
+            target_steer = 1.0
+            debug_text = "EVADE RIGHT >>"
+        else:
+            target_steer = 1.0
+            debug_text = "TRAPPED! PUSH RIGHT >>"
+        return target_steer, debug_text
+
+    if green_lanes:
+        if 0 in green_lanes:
+            target_steer = 0.0
+            debug_text = "SEEK GREEN AHEAD"
+        elif -1 in green_lanes and -1 not in danger_lanes:
+            target_steer = -1.0
+            debug_text = "<< SEEK GREEN LEFT"
+        elif 1 in green_lanes and 1 not in danger_lanes:
+            target_steer = 1.0
+            debug_text = "SEEK GREEN RIGHT >>"
+        return target_steer, debug_text
+
+    if current_lane < 0:
+        target_steer = 1.0
+        debug_text = "AUTO CENTER >>"
+    elif current_lane > 0:
+        target_steer = -1.0
+        debug_text = "<< AUTO CENTER"
+        
+    return target_steer, debug_text
+
 def processing_task():
     #This is where you write your image processing code to decide how to control the car
     #You can use libraries like OpenCV to process the image
     #There is no limtation to the complexity of the processing task, you can use any libraries you want
     #Remember to use the shared_data to get the latest frame
-    with data_lock:
+    with data_lock: 
         front_frame = shared_data['latest_front_frame']
-    
+        current_lane = shared_data.get('net_lane_position', 0)
+        
     if front_frame is not None:
         # write your processing here
         detected_objects, debug_tokens = detect_environment(front_frame)
-        print(f"[M2 TEST] Objects Detected: {len(detected_objects)}")
+        target_steer, debug_text = evaluate_decision(detected_objects, current_lane)
+
+        with data_lock:
+            shared_data['steering_input'] = target_steer
+            shared_data['debug_tokens'] = debug_tokens
+            shared_data['debug_info'] = f"AUTO: {debug_text}"
 
 def send_controls_task():
     #This is where you send the control commands to the car using the control_conn
@@ -296,7 +361,8 @@ def send_controls_task():
     #steering_input: -1.0 to 1.0 (left to right)
     #acceleration_input: -1.0 to 1.0 (reverse to forward)
     #this example always accelerate forward
-    steering_input = 0.0
+    with data_lock:
+        steering_input = shared_data['steering_input']
     acceleration_input = 1.0
 
     try:
