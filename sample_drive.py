@@ -4,7 +4,6 @@ import struct
 import cv2
 import numpy as np
 import time
-import keyboard
 import select
 import ctypes
 
@@ -23,13 +22,20 @@ shared_data = {
     'latest_back_frame': None,
     'steering_input' : 0.0,
     'acceleration_input' : 1.0,
-    'tap_state': 'IDLE', 
-    'debug_info': "WAITING",
-    'debug_tokens': [], 
-    'net_lane_position': 0 
+    'tap_state': 'IDLE',      
+    'debug_info': "WAITING",  
+    'debug_tokens': [],       
+    'net_lane_position': 0   
 }
 data_lock = threading.Lock()
 is_running = True
+
+# Tapping control variables
+tap_state = 'IDLE'            
+tap_timer = 0
+active_steering_value = 0.0
+TAP_HOLD_FRAMES = 10         
+COOLDOWN_FRAMES = 20         
 
 # ---------------------------------------------------------
 # Real-Time Scheduling Framework (Do not change this in your code)
@@ -138,73 +144,55 @@ def setup_control_server():
 # Task Implementations (This is where you write your tasks)
 # ---------------------------------------------------------
 
-def read_single_camera(sock, window_name, data_key):
+def read_single_camera(sock, data_key):
     #This function reads the latest frame from the camera socket and stores it in the shared data
-    if sock is None:
+    if sock is None: 
         return
-        
     try:
-        latest_frame_data = None
         sock.settimeout(None)
         length_bytes = sock.recv(4)
-        if not length_bytes:
-            return
-            
+        if not length_bytes: return
         image_length = int.from_bytes(length_bytes, 'little')
         received_bytes = b''
         while len(received_bytes) < image_length and is_running:
             packet = sock.recv(image_length - len(received_bytes))
-            if not packet:
-                break
+            if not packet: break
             received_bytes += packet
             
         if len(received_bytes) == image_length:
-            latest_frame_data = received_bytes
-            
+            np_arr = np.frombuffer(received_bytes, np.uint8)
+            frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+            if frame is not None:
+                with data_lock: shared_data[data_key] = frame
+                
+        # Clear backlog to ensure real-time performance
         while is_running:
             readable, _, _ = select.select([sock], [], [], 0.0)
-            if not readable:
-                break
-                
+            if not readable: break
             sock.settimeout(1.0)
             length_bytes = sock.recv(4)
-            if not length_bytes:
-                return
+            if not length_bytes: return
             image_length = int.from_bytes(length_bytes, 'little')
             received_bytes = b''
             while len(received_bytes) < image_length and is_running:
                 packet = sock.recv(image_length - len(received_bytes))
-                if not packet:
-                    break
+                if not packet: break
                 received_bytes += packet
-                
             if len(received_bytes) == image_length:
-                latest_frame_data = received_bytes
-                
-        if latest_frame_data is not None:
-            np_arr = np.frombuffer(latest_frame_data, np.uint8)
-            frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
-            if frame is not None:
-                with data_lock:
-                    shared_data[data_key] = frame
-                
-                # You may disable this if you don't need to display the frames / This could effect the fps
-                # NOTE: Disabled here because display and pause logic is now handled in the main thread loop
-                # frame_resized = cv2.resize(frame, (640, 480))
-                # cv2.imshow(window_name, frame_resized)
-                # cv2.waitKey(1)
-                
-    except Exception as e:
-        pass
+                np_arr = np.frombuffer(received_bytes, np.uint8)
+                frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+                if frame is not None:
+                    with data_lock: shared_data[data_key] = frame
+    except Exception: pass
 
-def read_front_camera_task():
-    read_single_camera(front_camera_sock, "Front Camera", 'latest_front_frame')
+def read_front_camera_task(): 
+    read_single_camera(front_camera_sock, 'latest_front_frame')
 
-def read_back_camera_task():
-    read_single_camera(back_camera_sock, "Back Camera", 'latest_back_frame')
+def read_back_camera_task(): 
+    read_single_camera(back_camera_sock, 'latest_back_frame')
 
 # ---------------------------------------------------------
-# Simplified Perception
+# Simplified Perception & Decision
 # ---------------------------------------------------------
 ROI_START_Y = 100
 
@@ -290,6 +278,7 @@ def evaluate_decision(detected_objects, current_lane):
     target_steer = 0.0
     debug_text = "CRUISING"
 
+    # Simplified tracking: Is there danger in left(-1), center(0), right(1)?
     danger_lanes = set()
     green_lanes = set()
 
@@ -299,6 +288,7 @@ def evaluate_decision(detected_objects, current_lane):
         elif obj['type'] == 'GREEN':
             for lane in obj['lanes']: green_lanes.add(lane)
 
+    # Highest Priority: Evade Danger directly ahead
     if 0 in danger_lanes:
         if -1 not in danger_lanes:
             target_steer = -1.0
@@ -307,10 +297,12 @@ def evaluate_decision(detected_objects, current_lane):
             target_steer = 1.0
             debug_text = "EVADE RIGHT >>"
         else:
+            # Trapped! Just pick right as default fallback
             target_steer = 1.0
             debug_text = "TRAPPED! PUSH RIGHT >>"
         return target_steer, debug_text
 
+    # Medium Priority: Seek Green if safe
     if green_lanes:
         if 0 in green_lanes:
             target_steer = 0.0
@@ -323,6 +315,7 @@ def evaluate_decision(detected_objects, current_lane):
             debug_text = "SEEK GREEN RIGHT >>"
         return target_steer, debug_text
 
+    # Lowest Priority: Auto-Center
     if current_lane < 0:
         target_steer = 1.0
         debug_text = "AUTO CENTER >>"
@@ -353,8 +346,8 @@ def processing_task():
 
 def send_controls_task():
     #This is where you send the control commands to the car using the control_conn
-    global control_conn
-    if control_conn is None:
+    global control_conn, tap_state, tap_timer, active_steering_value
+    if control_conn is None: 
         return
     
     #these are the variables used to control the car
@@ -362,12 +355,34 @@ def send_controls_task():
     #acceleration_input: -1.0 to 1.0 (reverse to forward)
     #this example always accelerate forward
     with data_lock:
-        steering_input = shared_data['steering_input']
-    acceleration_input = 1.0
+        auto_steer = shared_data['steering_input']
+        accel_input = shared_data['acceleration_input']
+
+    # --- Autonomous Tapping Logic ---
+    if tap_state == 'IDLE':
+        if auto_steer != 0.0:
+            active_steering_value = auto_steer
+            tap_state = 'TAPPING'
+            tap_timer = TAP_HOLD_FRAMES
+            
+            with data_lock:
+                if auto_steer < -0.1: shared_data['net_lane_position'] = max(-1, shared_data.get('net_lane_position', 0) - 1)
+                elif auto_steer > 0.1: shared_data['net_lane_position'] = min(1, shared_data.get('net_lane_position', 0) + 1)
+        else: active_steering_value = 0.0
+    elif tap_state == 'TAPPING':
+        if tap_timer > 0: tap_timer -= 1
+        else:
+            active_steering_value = 0.0
+            tap_state = 'COOLDOWN'
+            tap_timer = COOLDOWN_FRAMES
+    elif tap_state == 'COOLDOWN':
+        active_steering_value = 0.0
+        if tap_timer > 0: tap_timer -= 1
+        else: tap_state = 'IDLE'
 
     try:
         # Pack and send the control command
-        data = struct.pack('ff', steering_input, acceleration_input)
+        data = struct.pack('ff', active_steering_value, accel_input)
         control_conn.sendall(data)
     except Exception as e:
         print(f"Control send error: {e}")
@@ -390,8 +405,6 @@ if __name__ == '__main__':
     # Period refers to the period of execution of the task in seconds
     # Priority refers to the priority of the task, higher priority means higher priority
     # Concurrency refers to the number of instances of the task that can run at the same time
-    
-    # Periods and priorities updated based on new code
     t_front_camera = RTTask("ReadFrontCamera", period=0.01, priority=TaskPriority.LOW, execute_func=read_front_camera_task)
     t_back_camera = RTTask("ReadBackCamera", period=0.01, priority=TaskPriority.LOW, execute_func=read_back_camera_task)
     t_processing = RTTask("Processing", period=0.005, priority=TaskPriority.MEDIUM, execute_func=processing_task)
@@ -413,7 +426,6 @@ if __name__ == '__main__':
 
     try:
         # You need this to keep the main thread alive, otherwise the program will exit immediately
-        # New code display logic replaces the simple time.sleep(1)
         while is_running:
             with data_lock:
                 front_frame = shared_data['latest_front_frame']
