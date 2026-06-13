@@ -29,6 +29,8 @@ shared_data = {
     'debug_tokens': [],        
     'net_lane_position': 0,
     'low_light': False,
+    'chaser_behind': False,
+    'chaser_boxes': []
     'seek_red_end_time': 0.0
 }
 data_lock = threading.Lock()
@@ -244,6 +246,49 @@ def get_occupied_lanes(x, y, w, h):
     return lanes
 
 
+def detect_back_environment(back_frame):
+    if back_frame is None:
+        return []
+       
+    small_frame = cv2.resize(back_frame, (320, 240))
+
+
+    roi_back = small_frame[130:240, 40:280]
+   
+    roi_hsv = cv2.cvtColor(roi_back, cv2.COLOR_BGR2HSV)
+
+
+    mask_car = cv2.inRange(roi_hsv, np.array([85, 150, 80]), np.array([130, 255, 255]))
+   
+    contours, _ = cv2.findContours(mask_car, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+   
+    chaser_boxes = []
+    for c in contours:
+        area = cv2.contourArea(c)
+        x, y, w, h = cv2.boundingRect(c)
+       
+        if area > 0 or w >= 1 or h >= 1:
+            car_x = x + 40
+            car_y = y + 130
+           
+            scale = (car_y - 120) / 120.0
+            scale = max(0.1, min(1.0, scale))
+           
+            box_w = int(140 * scale)
+            box_h = int(60 * scale)
+           
+            center_x = car_x + w/2
+            center_y = car_y + h/2
+           
+            final_x = int(center_x - box_w/2)
+            final_y = int(center_y - box_h/2)
+           
+            chaser_boxes.append((final_x, final_y, box_w, box_h))
+            break
+               
+    return chaser_boxes
+
+
 def detect_environment(front_frame):
     global baseline_brightness
 
@@ -251,6 +296,11 @@ def detect_environment(front_frame):
     small_frame = cv2.resize(front_frame, (320, 240))
     roi_front = small_frame[ROI_START_Y:190, 0:320]
    
+    # Gaussian Blur for stability
+    blurred_roi = cv2.GaussianBlur(roi_front, (5, 5), 0)
+    roi_hsv = cv2.cvtColor(blurred_roi, cv2.COLOR_BGR2HSV)
+   
+    # Low Brightness Detection Logic
     blurred_roi = cv2.GaussianBlur(roi_front, (5, 5), 0)
     roi_hsv = cv2.cvtColor(blurred_roi, cv2.COLOR_BGR2HSV)
    
@@ -276,6 +326,11 @@ def detect_environment(front_frame):
     mask_red2 = cv2.inRange(roi_hsv, np.array([170, 120, 70]), np.array([180, 255, 255]))
     mask_red = mask_red1 | mask_red2
     mask_yellow = cv2.inRange(roi_hsv, np.array([15, 100, 100]), np.array([35, 255, 255]))
+
+
+    contours_g, _ = cv2.findContours(mask_green, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contours_red, _ = cv2.findContours(mask_red, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contours_yellow, _ = cv2.findContours(mask_yellow, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     mask_blue = cv2.inRange(roi_hsv, np.array([90, 90, 100]), np.array([135, 255, 255]))
    
     contours_g, _ = cv2.findContours(mask_green, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -286,6 +341,8 @@ def detect_environment(front_frame):
 
     detected_objects = []
     debug_tokens = []
+
+
    
     red_boxes = []
     for c in contours_red:
@@ -381,6 +438,19 @@ def detect_environment(front_frame):
                 lanes = get_occupied_lanes(x, y, w, h)
                 if lanes:
                     dist = (y + h/2 + ROI_START_Y) - 80
+                    detected_objects.append({'type': 'DANGER', 'lanes': lanes, 'dist': dist})
+                    debug_tokens.append(('DANGER_RED', x*2, (y+ROI_START_Y)*2, w*2, h*2))
+
+
+    for c in contours_yellow:
+        area = cv2.contourArea(c)
+        if area > 5:
+            x, y, w, h = cv2.boundingRect(c)
+            if 0.3 < float(w)/h < 3.0:
+                lanes = get_occupied_lanes(x, y, w, h)
+                if lanes:
+                    dist = (y + h/2 + ROI_START_Y) - 80
+                    detected_objects.append({'type': 'DANGER', 'lanes': lanes, 'dist': dist})
                     detected_objects.append({'type': 'DANGER', 'subtype': 'YELLOW', 'lanes': lanes, 'dist': dist})
                     debug_tokens.append(('DANGER_YELLOW', x*2, (y+ROI_START_Y)*2, w*2, h*2))
    
@@ -403,12 +473,20 @@ def detect_environment(front_frame):
     return detected_objects, debug_tokens, low_light_mode
 
 
+def evaluate_decision(detected_objects, current_lane, low_light_mode, chaser_behind, chaser_boxes):
 def evaluate_decision(detected_objects, current_lane, low_light_mode, seek_red_mode):
     target_steer = 0.0
     target_accel = 1.0
     debug_text = "CRUISING"
 
 
+    # Low brightness event reaction
+    if low_light_mode and not chaser_behind:
+        return 0.0, -1.0, "LOW LIGHT: BRAKING TO RECOVER"
+
+
+    # Simplified tracking: Is there danger in left(-1), center(0), right(1)?
+    danger_lanes = set()
     if low_light_mode:
         return 0.0, -1.0, "LOW LIGHT: BRAKING TO RECOVER"
 
@@ -420,6 +498,82 @@ def evaluate_decision(detected_objects, current_lane, low_light_mode, seek_red_m
 
 
     for obj in detected_objects:
+        if obj['type'] == 'DANGER':
+            for lane in obj['lanes']: danger_lanes.add(lane)
+        elif obj['type'] == 'GREEN':
+            for lane in obj['lanes']: green_lanes.add(lane)
+
+
+    # Calculate chaser lane
+    chaser_lanes = set()
+    if chaser_behind:
+        for (cx, cy, cw, ch) in chaser_boxes:
+            center_x = cx + cw / 2.0
+            if center_x < 130:
+                chaser_lanes.add(-1)
+            elif center_x > 190:
+                chaser_lanes.add(1)
+            else:
+                chaser_lanes.add(0)
+
+
+    # Priority 1: Evade Chaser from behind
+    if chaser_behind and current_lane in chaser_lanes:
+        target_accel = 1.0
+        safe_lanes = [l for l in [-1, 0, 1] if l not in danger_lanes and l not in chaser_lanes]
+        if safe_lanes:
+            best_lane = min(safe_lanes, key=lambda l: abs(l - current_lane))
+        else:
+            semi_safe = [l for l in [-1, 0, 1] if l not in chaser_lanes]
+            if semi_safe:
+                best_lane = min(semi_safe, key=lambda l: abs(l - current_lane))
+            else:
+                best_lane = current_lane
+       
+        if best_lane < current_lane:
+            return -1.0, target_accel, "<< DODGE CHASER LEFT"
+        elif best_lane > current_lane:
+            return 1.0, target_accel, "DODGE CHASER RIGHT >>"
+        else:
+            return 0.0, target_accel, "CHASER IMMINENT! FLOOR IT!"
+
+
+    # Highest Priority (Front): Evade Danger directly ahead
+    if 0 in danger_lanes:
+        if -1 not in danger_lanes:
+            target_steer = -1.0
+            debug_text = "<< EVADE LEFT"
+        elif 1 not in danger_lanes:
+            target_steer = 1.0
+            debug_text = "EVADE RIGHT >>"
+        else:
+            # Trapped! Just pick right as default fallback
+            target_steer = 1.0
+            debug_text = "TRAPPED! PUSH RIGHT >>"
+        return target_steer, target_accel, debug_text
+
+
+    # Medium Priority: Seek Green if safe
+    if green_lanes:
+        if 0 in green_lanes:
+            target_steer = 0.0
+            debug_text = "SEEK GREEN AHEAD"
+        elif -1 in green_lanes and -1 not in danger_lanes:
+            target_steer = -1.0
+            debug_text = "<< SEEK GREEN LEFT"
+        elif 1 in green_lanes and 1 not in danger_lanes:
+            target_steer = 1.0
+            debug_text = "SEEK GREEN RIGHT >>"
+        return target_steer, target_accel, debug_text
+
+
+    # Lowest Priority: Auto-Center
+    if current_lane < 0:
+        target_steer = 1.0
+        debug_text = "AUTO CENTER >>"
+    elif current_lane > 0:
+        target_steer = -1.0
+        debug_text = "<< AUTO CENTER"
         for lane in obj['lanes']:
             if obj['type'] == 'DANGER':
                 if obj.get('subtype') == 'POLICE':
@@ -487,6 +641,15 @@ def processing_task():
     #Remember to use the shared_data to get the latest frame
     with data_lock:
         front_frame = shared_data['latest_front_frame']
+        back_frame = shared_data.get('latest_back_frame')
+        current_lane = shared_data.get('net_lane_position', 0)
+       
+    if front_frame is not None:
+        # write your processing here
+        chaser_boxes = detect_back_environment(back_frame)
+        chaser_behind = len(chaser_boxes) > 0
+        detected_objects, debug_tokens, low_light_mode = detect_environment(front_frame)
+        target_steer, target_accel, debug_text = evaluate_decision(detected_objects, current_lane, low_light_mode, chaser_behind, chaser_boxes)
         current_lane = shared_data.get('net_lane_position', 0)
         last_processed_id = shared_data.get('last_processed_id', None)
        
@@ -523,6 +686,8 @@ def processing_task():
             shared_data['debug_tokens'] = debug_tokens
             shared_data['debug_info'] = f"AUTO: {debug_text}"
             shared_data['low_light'] = low_light_mode
+            shared_data['chaser_behind'] = chaser_behind
+            shared_data['chaser_boxes'] = chaser_boxes
 
 
 def send_controls_task():
@@ -540,6 +705,7 @@ def send_controls_task():
         accel_input = shared_data['acceleration_input']
 
 
+    # --- Autonomous Tapping Logic ---
     if tap_state == 'IDLE':
         if auto_steer != 0.0:
             active_steering_value = auto_steer
@@ -563,6 +729,7 @@ def send_controls_task():
 
 
     try:
+        # Pack and send the control command
         data = struct.pack('ff', active_steering_value, accel_input)
         control_conn.sendall(data)
     except Exception as e:
@@ -619,6 +786,8 @@ if __name__ == '__main__':
                 debug_tokens = shared_data['debug_tokens'].copy()
                 steer_input = shared_data['steering_input']
                 low_light = shared_data.get('low_light', False)
+                chaser_behind = shared_data.get('chaser_behind', False)
+                chaser_boxes = shared_data.get('chaser_boxes', [])
 
 
             key = cv2.waitKey(1) & 0xFF
@@ -651,6 +820,14 @@ if __name__ == '__main__':
                 cv2.line(display_front, (320 - int(20*0.22*2), 200), (320 - int(160*0.22*2), 480), (255, 255, 255), 2)
                 cv2.line(display_front, (320 + int(20*0.22*2), 200), (320 + int(160*0.22*2), 480), (255, 255, 255), 2)
                
+                if low_light:
+                    cv2.putText(display_front, "LOW LIGHT DETECTED", (150, 100), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 3)
+
+
+                for token_data in debug_tokens:
+                    if len(token_data) >= 5:
+                        ttype, x, y, w, h = token_data[:5]
+                        color = (0, 0, 255) if 'RED' in ttype else (0, 255, 0)
                 for token_data in debug_tokens:
                     if len(token_data) >= 5:
                         ttype, x, y, w, h = token_data[:5]
@@ -663,6 +840,7 @@ if __name__ == '__main__':
                         cv2.putText(display_front, ttype, (x, y-5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
 
 
+                # Draw Action text from sample_drive1
                 action_text = "STRAIGHT"
                 if steer_input < -0.1: action_text = "<< STEER LEFT <<"
                 elif steer_input > 0.1: action_text = ">> STEER RIGHT >>"
@@ -673,6 +851,13 @@ if __name__ == '__main__':
                
             if back_frame is not None and not display_paused:
                 display_back = cv2.resize(back_frame, (320, 240))
+               
+                if chaser_behind:
+                    cv2.putText(display_back, "CHASER WARNING", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                    for (x, y, w, h) in chaser_boxes:
+                        cv2.rectangle(display_back, (x, y), (x+w, y+h), (0, 0, 255), 2)
+                        cv2.putText(display_back, "CHASER", (x, y-5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1)
+                   
                 cv2.imshow("Back Camera", display_back)
 
 
