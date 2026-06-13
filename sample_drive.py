@@ -31,6 +31,7 @@ shared_data = {
     'low_light': False,
     'chaser_behind': False,
     'chaser_boxes': []
+    'seek_red_end_time': 0.0
 }
 data_lock = threading.Lock()
 is_running = True
@@ -300,6 +301,9 @@ def detect_environment(front_frame):
     roi_hsv = cv2.cvtColor(blurred_roi, cv2.COLOR_BGR2HSV)
    
     # Low Brightness Detection Logic
+    blurred_roi = cv2.GaussianBlur(roi_front, (5, 5), 0)
+    roi_hsv = cv2.cvtColor(blurred_roi, cv2.COLOR_BGR2HSV)
+   
     gray_frame = cv2.cvtColor(small_frame, cv2.COLOR_BGR2GRAY)
     left_periph = gray_frame[120:180, 0:40]
     right_periph = gray_frame[120:180, 280:320]
@@ -327,16 +331,109 @@ def detect_environment(front_frame):
     contours_g, _ = cv2.findContours(mask_green, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     contours_red, _ = cv2.findContours(mask_red, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     contours_yellow, _ = cv2.findContours(mask_yellow, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    mask_blue = cv2.inRange(roi_hsv, np.array([90, 90, 100]), np.array([135, 255, 255]))
+   
+    contours_g, _ = cv2.findContours(mask_green, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contours_red, _ = cv2.findContours(mask_red, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contours_yellow, _ = cv2.findContours(mask_yellow, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contours_blue, _ = cv2.findContours(mask_blue, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
 
     detected_objects = []
     debug_tokens = []
 
 
+   
+    red_boxes = []
     for c in contours_red:
+        area = cv2.contourArea(c)
+        if 2 < area < 400:
+            x, y, w, h = cv2.boundingRect(c)
+            if y > 15:
+                red_boxes.append((x, y, w, h))
+
+
+    police_car_zones = []
+
+
+    for c in contours_blue:
+        area = cv2.contourArea(c)
+        if 2 < area < 400:
+            bx, by, bw, bh = cv2.boundingRect(c)
+           
+            if by <= 15: continue
+               
+            b_cx, b_cy = bx + bw/2.0, by + bh/2.0
+           
+            is_police = False
+            rx, ry, rw, rh = 0, 0, 0, 0
+           
+            for r_box in red_boxes:
+                tx, ty, tw, th = r_box
+                r_cx, r_cy = tx + tw/2.0, ty + th/2.0
+               
+                vert_aligned = abs(b_cy - r_cy) < 10
+                width_ratio = bw / max(1.0, float(tw))
+                height_ratio = bh / max(1.0, float(th))
+                similar_size = (0.3 < width_ratio < 3.0) and (0.3 < height_ratio < 3.0)
+               
+                max_gap = max(bw, tw) * 1.5
+                dist_x = abs(b_cx - r_cx)
+                horiz_adjacent = dist_x < (bw/2.0 + tw/2.0 + max_gap)
+               
+                if vert_aligned and similar_size and horiz_adjacent:
+                    is_police = True
+                    rx, ry, rw, rh = tx, ty, tw, th
+                    break
+           
+            if is_police:
+                light_x = min(bx, rx)
+                light_y = min(by, ry)
+                light_w = max(bx+bw, rx+rw) - light_x
+                light_h = max(by+bh, ry+rh) - light_y
+               
+                light_aspect = light_w / max(1.0, float(light_h))
+               
+                if light_w < 120 and light_aspect > 1.2:
+                    car_x = max(0, light_x - int(light_w * 0.1))
+                    car_w = int(light_w * 1.2)
+                    car_y = max(0, light_y - int(light_h * 0.2))
+                    car_h = int(light_h * 4.0)
+                   
+                    police_car_zones.append((car_x, car_y, car_w, car_h))
+                   
+                    lanes = get_occupied_lanes(car_x, car_y, car_w, car_h)
+                    if lanes:
+                        dist = (car_y + car_h/2 + ROI_START_Y) - 80
+                        detected_objects.append({'type': 'DANGER', 'subtype': 'POLICE', 'lanes': lanes, 'dist': dist})
+                        debug_tokens.append(('POLICE', car_x*2, (car_y+ROI_START_Y)*2, car_w*2, car_h*2))
+
+
+    for r_box in red_boxes:
+        x, y, w, h = r_box
+        cx, cy = x + w/2, y + h/2
+       
+        is_part_of_police = any(px <= cx <= px+pw and py <= cy <= py+ph for (px, py, pw, ph) in police_car_zones)
+        if is_part_of_police: continue
+
+
+        if 0.3 < float(w)/h < 3.0:
+            lanes = get_occupied_lanes(x, y, w, h)
+            if lanes:
+                dist = (y + h/2 + ROI_START_Y) - 80
+                detected_objects.append({'type': 'DANGER', 'subtype': 'RED', 'lanes': lanes, 'dist': dist})
+                debug_tokens.append(('DANGER_RED', x*2, (y+ROI_START_Y)*2, w*2, h*2))
+
+
+    for c in contours_yellow:
         area = cv2.contourArea(c)
         if area > 5:
             x, y, w, h = cv2.boundingRect(c)
+            cx, cy = x + w/2, y + h/2
+            is_part_of_police = any(px <= cx <= px+pw and py <= cy <= py+ph for (px, py, pw, ph) in police_car_zones)
+            if is_part_of_police: continue
+
+
             if 0.3 < float(w)/h < 3.0:
                 lanes = get_occupied_lanes(x, y, w, h)
                 if lanes:
@@ -354,23 +451,30 @@ def detect_environment(front_frame):
                 if lanes:
                     dist = (y + h/2 + ROI_START_Y) - 80
                     detected_objects.append({'type': 'DANGER', 'lanes': lanes, 'dist': dist})
+                    detected_objects.append({'type': 'DANGER', 'subtype': 'YELLOW', 'lanes': lanes, 'dist': dist})
                     debug_tokens.append(('DANGER_YELLOW', x*2, (y+ROI_START_Y)*2, w*2, h*2))
    
     for c in contours_g:
         area = cv2.contourArea(c)
         if area > 5:
             x, y, w, h = cv2.boundingRect(c)
+            cx, cy = x + w/2, y + h/2
+            is_part_of_police = any(px <= cx <= px+pw and py <= cy <= py+ph for (px, py, pw, ph) in police_car_zones)
+            if is_part_of_police: continue
+
+
             if 0.3 < float(w)/h < 3.0:
                 lanes = get_occupied_lanes(x, y, w, h)
                 if lanes:
                     dist = (y + h/2 + ROI_START_Y) - 80
-                    detected_objects.append({'type': 'GREEN', 'lanes': lanes, 'dist': dist})
+                    detected_objects.append({'type': 'GREEN', 'subtype': 'GREEN', 'lanes': lanes, 'dist': dist})
                     debug_tokens.append(('GREEN', x*2, (y+ROI_START_Y)*2, w*2, h*2))
                    
     return detected_objects, debug_tokens, low_light_mode
 
 
 def evaluate_decision(detected_objects, current_lane, low_light_mode, chaser_behind, chaser_boxes):
+def evaluate_decision(detected_objects, current_lane, low_light_mode, seek_red_mode):
     target_steer = 0.0
     target_accel = 1.0
     debug_text = "CRUISING"
@@ -383,6 +487,13 @@ def evaluate_decision(detected_objects, current_lane, low_light_mode, chaser_beh
 
     # Simplified tracking: Is there danger in left(-1), center(0), right(1)?
     danger_lanes = set()
+    if low_light_mode:
+        return 0.0, -1.0, "LOW LIGHT: BRAKING TO RECOVER"
+
+
+    police_lanes = set()
+    danger_lanes = set()
+    red_lanes = set()
     green_lanes = set()
 
 
@@ -463,6 +574,62 @@ def evaluate_decision(detected_objects, current_lane, low_light_mode, chaser_beh
     elif current_lane > 0:
         target_steer = -1.0
         debug_text = "<< AUTO CENTER"
+        for lane in obj['lanes']:
+            if obj['type'] == 'DANGER':
+                if obj.get('subtype') == 'POLICE':
+                    police_lanes.add(lane)
+                elif obj.get('subtype') == 'RED':
+                    red_lanes.add(lane)
+                    if not seek_red_mode:
+                        danger_lanes.add(lane)
+                else:
+                    danger_lanes.add(lane)
+            elif obj['type'] == 'GREEN':
+                green_lanes.add(lane)
+
+
+    if 0 in police_lanes:
+        if -1 not in police_lanes and -1 not in danger_lanes:
+            return -1.0, target_accel, "<< EVADE POLICE LEFT"
+        elif 1 not in police_lanes and 1 not in danger_lanes:
+            return 1.0, target_accel, "EVADE POLICE RIGHT >>"
+        elif -1 not in police_lanes:
+            return -1.0, target_accel, "<< EVADE POLICE LEFT (RISK)"
+        else:
+            return 1.0, target_accel, "EVADE POLICE RIGHT (RISK) >>"
+
+
+    if seek_red_mode and red_lanes:
+        if 0 in red_lanes and 0 not in police_lanes:
+            return 0.0, target_accel, "SEEKING RED AHEAD"
+        elif -1 in red_lanes and -1 not in police_lanes:
+            return -1.0, target_accel, "<< SEEKING RED LEFT"
+        elif 1 in red_lanes and 1 not in police_lanes:
+            return 1.0, target_accel, "SEEKING RED RIGHT >>"
+
+
+    if 0 in danger_lanes:
+        if -1 not in danger_lanes and -1 not in police_lanes:
+            return -1.0, target_accel, "<< EVADE LEFT"
+        elif 1 not in danger_lanes and 1 not in police_lanes:
+            return 1.0, target_accel, "EVADE RIGHT >>"
+        else:
+            return 1.0, target_accel, "TRAPPED! PUSH RIGHT >>"
+
+
+    if green_lanes:
+        if 0 in green_lanes:
+            return 0.0, target_accel, "SEEK GREEN AHEAD"
+        elif -1 in green_lanes and -1 not in danger_lanes and -1 not in police_lanes:
+            return -1.0, target_accel, "<< SEEK GREEN LEFT"
+        elif 1 in green_lanes and 1 not in danger_lanes and 1 not in police_lanes:
+            return 1.0, target_accel, "SEEK GREEN RIGHT >>"
+
+
+    if current_lane < 0 and 1 not in police_lanes and 1 not in danger_lanes:
+        return 1.0, target_accel, "AUTO CENTER >>"
+    elif current_lane > 0 and -1 not in police_lanes and -1 not in danger_lanes:
+        return -1.0, target_accel, "<< AUTO CENTER"
        
     return target_steer, target_accel, debug_text
 
@@ -483,6 +650,34 @@ def processing_task():
         chaser_behind = len(chaser_boxes) > 0
         detected_objects, debug_tokens, low_light_mode = detect_environment(front_frame)
         target_steer, target_accel, debug_text = evaluate_decision(detected_objects, current_lane, low_light_mode, chaser_behind, chaser_boxes)
+        current_lane = shared_data.get('net_lane_position', 0)
+        last_processed_id = shared_data.get('last_processed_id', None)
+       
+    if front_frame is not None and id(front_frame) != last_processed_id:
+        with data_lock:
+            shared_data['last_processed_id'] = id(front_frame)
+           
+        detected_objects, debug_tokens, low_light_mode = detect_environment(front_frame)
+       
+        police_detected = any('POLICE' in t[0] for t in debug_tokens)
+       
+        with data_lock:
+            seek_red_end = shared_data.get('seek_red_end_time', 0.0)
+            if police_detected:
+                shared_data['seek_red_end_time'] = time.time() + 5.0
+                seek_red_end = shared_data['seek_red_end_time']
+               
+            seek_red_mode = time.time() < seek_red_end
+           
+            if seek_red_mode:
+                for obj in detected_objects:
+                    if obj.get('subtype') == 'RED' and current_lane in obj['lanes']:
+                        if obj['dist'] > -5:
+                            shared_data['seek_red_end_time'] = 0.0
+                            seek_red_mode = False
+                            break
+                           
+        target_steer, target_accel, debug_text = evaluate_decision(detected_objects, current_lane, low_light_mode, seek_red_mode)
 
 
         with data_lock:
@@ -606,6 +801,17 @@ if __name__ == '__main__':
                 display_front = cv2.resize(front_frame, (640, 480))
                
                 cv2.putText(display_front, debug_info, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+               
+                with data_lock:
+                    seek_red_end = shared_data.get('seek_red_end_time', 0.0)
+                time_left = seek_red_end - time.time()
+                if time_left > 0:
+                    cv2.putText(display_front, f"SEEK RED MODE: {time_left:.1f}s", (120, 150), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 3)
+               
+                if low_light:
+                    cv2.putText(display_front, "LOW LIGHT DETECTED", (150, 100), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 3)
+
+
                 cv2.line(display_front, (0, 200), (640, 200), (255, 0, 0), 2)
                 cv2.line(display_front, (0, 440), (640, 440), (255, 0, 0), 2)
                 cv2.putText(display_front, "ROI BOUNDARY", (10, 195), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1)
@@ -622,6 +828,14 @@ if __name__ == '__main__':
                     if len(token_data) >= 5:
                         ttype, x, y, w, h = token_data[:5]
                         color = (0, 0, 255) if 'RED' in ttype else (0, 255, 0)
+                for token_data in debug_tokens:
+                    if len(token_data) >= 5:
+                        ttype, x, y, w, h = token_data[:5]
+                       
+                        if 'POLICE' in ttype: color = (255, 0, 0)
+                        elif 'DANGER' in ttype: color = (0, 0, 255)
+                        else: color = (0, 255, 0)
+                       
                         cv2.rectangle(display_front, (x, y), (x+w, y+h), color, 2)
                         cv2.putText(display_front, ttype, (x, y-5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
 
