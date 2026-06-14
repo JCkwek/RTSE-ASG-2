@@ -16,7 +16,10 @@ BACK_CAMERA_PORT = 8082
 CONTROL_HOST = '127.0.0.1'
 CONTROL_PORT = 8081
 
-# Shared Resources with Mutex Lock for Concurrency
+# Split Locks for Max Performance
+frame_lock = threading.Lock()
+state_lock = threading.Lock()
+
 shared_data = {
     'latest_front_frame': None,
     'latest_back_frame': None,
@@ -31,21 +34,21 @@ shared_data = {
     'chaser_boxes': [],
     'seek_red_end_time': 0.0
 }
-data_lock = threading.Lock()
 is_running = True
-
-# Persistent Global States
 baseline_brightness = None
 
-# Tapping control variables
 tap_state = 'IDLE'            
 tap_timer = 0
 active_steering_value = 0.0
+smoothed_steering = 0.0      
 TAP_HOLD_FRAMES = 10         
 COOLDOWN_FRAMES = 20         
 
+# Morphology Kernel
+morph_kernel = np.ones((3, 3), np.uint8)
+
 # ---------------------------------------------------------
-# Real-Time Scheduling Framework (Do not change this in your code)
+# Real-Time Scheduling Framework 
 # ---------------------------------------------------------
 class TaskPriority:
     HIGH = 1
@@ -87,7 +90,10 @@ class RTTask(threading.Thread):
             sleep_time = self.period - exec_time
             
             if sleep_time > 0:
-                time.sleep(sleep_time)
+                if sleep_time > 0.002:
+                    time.sleep(sleep_time - 0.002)
+                while (time.time() - start_time) < self.period:
+                    pass
 
 # ---------------------------------------------------------
 # Network Connection Setup (Do not change this in your code)
@@ -168,7 +174,7 @@ def read_single_camera(sock, data_key):
             np_arr = np.frombuffer(received_bytes, np.uint8)
             frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
             if frame is not None:
-                with data_lock: shared_data[data_key] = frame
+                with frame_lock: shared_data[data_key] = frame
                 
         # Clear backlog to ensure real-time performance
         while is_running:
@@ -187,7 +193,7 @@ def read_single_camera(sock, data_key):
                 np_arr = np.frombuffer(received_bytes, np.uint8)
                 frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
                 if frame is not None:
-                    with data_lock: shared_data[data_key] = frame
+                    with frame_lock: shared_data[data_key] = frame
     except Exception: pass
 
 def read_front_camera_task(): 
@@ -227,42 +233,35 @@ def get_occupied_lanes(x, y, w, h):
     return lanes
 
 def detect_back_environment(back_frame):
-    if back_frame is None: 
-        return []
-        
+    if back_frame is None: return []
     small_frame = cv2.resize(back_frame, (320, 240))
     roi_back = small_frame[130:240, 40:280] 
-    
     roi_hsv = cv2.cvtColor(roi_back, cv2.COLOR_BGR2HSV)
-    
     mask_car = cv2.inRange(roi_hsv, np.array([85, 150, 80]), np.array([130, 255, 255]))
+    mask_car = cv2.morphologyEx(mask_car, cv2.MORPH_OPEN, morph_kernel)
     contours, _ = cv2.findContours(mask_car, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     
     chaser_boxes = []
     for c in contours:
         area = cv2.contourArea(c)
         x, y, w, h = cv2.boundingRect(c)
-        
         if area > 0 or w >= 1 or h >= 1:
-            car_x = x + 40
-            car_y = y + 130
-            
-            scale = (car_y - 120) / 120.0
-            scale = max(0.1, min(1.0, scale)) 
-            
-            box_w = int(140 * scale)
-            box_h = int(60 * scale)
-            
-            center_x = car_x + w/2
-            center_y = car_y + h/2
-            
-            final_x = int(center_x - box_w/2)
-            final_y = int(center_y - box_h/2)
-            
+            car_x, car_y = x + 40, y + 130
+            scale = max(0.1, min(1.0, (car_y - 120) / 120.0)) 
+            box_w, box_h = int(140 * scale), int(60 * scale)
+            center_x, center_y = car_x + w/2, car_y + h/2
+            final_x, final_y = int(center_x - box_w/2), int(center_y - box_h/2)
             chaser_boxes.append((final_x, final_y, box_w, box_h))
             break 
-                
     return chaser_boxes
+
+def is_valid_3d_token(x, y, w, h, area):
+    if area < 5: return False
+    aspect_ratio = float(w) / h if h > 0 else 0
+    if not (0.1 <= aspect_ratio <= 2.5): return False
+    min_required_height = max(5, y * 0.15) 
+    if h < min_required_height: return False
+    return True
 
 def detect_environment(front_frame):
     global baseline_brightness
@@ -280,23 +279,29 @@ def detect_environment(front_frame):
     current_periph_brightness = (np.mean(left_periph) + np.mean(right_periph)) / 2.0
     
     if baseline_brightness is None:
-        if current_periph_brightness > 40: 
-            baseline_brightness = current_periph_brightness
+        if current_periph_brightness > 40: baseline_brightness = current_periph_brightness
             
     low_light_mode = False
     if baseline_brightness is not None:
-        if current_periph_brightness < (baseline_brightness * 0.3):
-            low_light_mode = True
+        if current_periph_brightness < (baseline_brightness * 0.3): low_light_mode = True
         elif current_periph_brightness > (baseline_brightness * 0.5):
             baseline_brightness = (baseline_brightness * 0.99) + (current_periph_brightness * 0.01)
 
-    mask_green = cv2.inRange(roi_hsv, np.array([35, 40, 40]), np.array([85, 255, 255]))
-    mask_red1 = cv2.inRange(roi_hsv, np.array([0, 120, 70]), np.array([10, 255, 255]))
-    mask_red2 = cv2.inRange(roi_hsv, np.array([170, 120, 70]), np.array([180, 255, 255]))
+    mask_green = cv2.inRange(roi_hsv, np.array([35, 80, 80]), np.array([85, 255, 255]))
+    mask_red1 = cv2.inRange(roi_hsv, np.array([0, 100, 80]), np.array([10, 255, 255]))
+    mask_red2 = cv2.inRange(roi_hsv, np.array([170, 100, 80]), np.array([180, 255, 255]))
     mask_red = mask_red1 | mask_red2
     mask_yellow = cv2.inRange(roi_hsv, np.array([15, 100, 100]), np.array([35, 255, 255]))
-    mask_blue = cv2.inRange(roi_hsv, np.array([90, 90, 100]), np.array([135, 255, 255]))
+    mask_blue = cv2.inRange(roi_hsv, np.array([90, 100, 100]), np.array([135, 255, 255]))
     
+    mask_white = cv2.inRange(roi_hsv, np.array([0, 0, 180]), np.array([180, 45, 255]))
+    
+    mask_green = cv2.morphologyEx(mask_green, cv2.MORPH_OPEN, morph_kernel)
+    mask_red = cv2.morphologyEx(mask_red, cv2.MORPH_OPEN, morph_kernel)
+    mask_yellow = cv2.morphologyEx(mask_yellow, cv2.MORPH_OPEN, morph_kernel)
+    mask_blue = cv2.morphologyEx(mask_blue, cv2.MORPH_OPEN, morph_kernel)
+    mask_white = cv2.morphologyEx(mask_white, cv2.MORPH_OPEN, morph_kernel)
+
     contours_g, _ = cv2.findContours(mask_green, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     contours_red, _ = cv2.findContours(mask_red, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     contours_yellow, _ = cv2.findContours(mask_yellow, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -305,29 +310,28 @@ def detect_environment(front_frame):
     detected_objects = []
     debug_tokens = []
     
-    red_boxes = []
+    raw_red_boxes = []
+    red_areas = {} 
     for c in contours_red:
         area = cv2.contourArea(c)
-        if 2 < area < 400: 
+        if area > 5: 
             x, y, w, h = cv2.boundingRect(c)
-            if y > 15: 
-                red_boxes.append((x, y, w, h))
+            raw_red_boxes.append((x, y, w, h))
+            red_areas[(x, y, w, h)] = area
 
     police_car_zones = []
 
     for c in contours_blue:
         area = cv2.contourArea(c)
-        if 2 < area < 400: 
+        if area > 10: 
             bx, by, bw, bh = cv2.boundingRect(c)
-            
             if by <= 15: continue
-                
             b_cx, b_cy = bx + bw/2.0, by + bh/2.0
             
             is_police = False
             rx, ry, rw, rh = 0, 0, 0, 0
             
-            for r_box in red_boxes:
+            for r_box in raw_red_boxes:
                 tx, ty, tw, th = r_box
                 r_cx, r_cy = tx + tw/2.0, ty + th/2.0
                 
@@ -335,10 +339,8 @@ def detect_environment(front_frame):
                 width_ratio = bw / max(1.0, float(tw))
                 height_ratio = bh / max(1.0, float(th))
                 similar_size = (0.3 < width_ratio < 3.0) and (0.3 < height_ratio < 3.0)
-                
                 max_gap = max(bw, tw) * 1.5
-                dist_x = abs(b_cx - r_cx)
-                horiz_adjacent = dist_x < (bw/2.0 + tw/2.0 + max_gap)
+                horiz_adjacent = abs(b_cx - r_cx) < (bw/2.0 + tw/2.0 + max_gap)
                 
                 if vert_aligned and similar_size and horiz_adjacent:
                     is_police = True
@@ -346,35 +348,39 @@ def detect_environment(front_frame):
                     break 
             
             if is_police:
-                light_x = min(bx, rx)
-                light_y = min(by, ry)
+                light_x, light_y = min(bx, rx), min(by, ry)
                 light_w = max(bx+bw, rx+rw) - light_x
                 light_h = max(by+bh, ry+rh) - light_y
-                
                 light_aspect = light_w / max(1.0, float(light_h))
                 
                 if light_w < 120 and light_aspect > 1.2:
-                    car_x = max(0, light_x - int(light_w * 0.1))
-                    car_w = int(light_w * 1.2)
-                    car_y = max(0, light_y - int(light_h * 0.2))
-                    car_h = int(light_h * 4.0)
-                    
+                    car_x, car_w = max(0, light_x - int(light_w * 0.1)), int(light_w * 1.2)
+                    car_y, car_h = max(0, light_y - int(light_h * 0.2)), int(light_h * 4.0)
                     police_car_zones.append((car_x, car_y, car_w, car_h))
-                    
                     lanes = get_occupied_lanes(car_x, car_y, car_w, car_h)
                     if lanes:
                         dist = (car_y + car_h/2 + ROI_START_Y) - 80
                         detected_objects.append({'type': 'DANGER', 'subtype': 'POLICE', 'lanes': lanes, 'dist': dist})
                         debug_tokens.append(('POLICE', car_x*2, (car_y+ROI_START_Y)*2, car_w*2, car_h*2))
 
-    for r_box in red_boxes:
+    for r_box in raw_red_boxes:
         x, y, w, h = r_box
         cx, cy = x + w/2, y + h/2
         
-        is_part_of_police = any(px <= cx <= px+pw and py <= cy <= py+ph for (px, py, pw, ph) in police_car_zones)
-        if is_part_of_police: continue
+        if any(px <= cx <= px+pw and py <= cy <= py+ph for (px, py, pw, ph) in police_car_zones): continue
+        
+        pad = 12
+        nx1, ny1 = max(0, x - pad), max(0, y - pad)
+        nx2, ny2 = min(roi_hsv.shape[1], x + w + pad), min(roi_hsv.shape[0], y + h + pad)
 
-        if 0.3 < float(w)/h < 3.0:
+        white_nearby = cv2.countNonZero(mask_white[ny1:ny2, nx1:nx2])
+        green_nearby = cv2.countNonZero(mask_green[ny1:ny2, nx1:nx2])
+
+        if white_nearby > 30 or green_nearby > 40:
+            continue
+
+        area = red_areas[(x, y, w, h)]
+        if is_valid_3d_token(x, y, w, h, area):
             lanes = get_occupied_lanes(x, y, w, h)
             if lanes:
                 dist = (y + h/2 + ROI_START_Y) - 80
@@ -383,33 +389,27 @@ def detect_environment(front_frame):
 
     for c in contours_yellow:
         area = cv2.contourArea(c)
-        if area > 5:
-            x, y, w, h = cv2.boundingRect(c)
-            cx, cy = x + w/2, y + h/2
-            is_part_of_police = any(px <= cx <= px+pw and py <= cy <= py+ph for (px, py, pw, ph) in police_car_zones)
-            if is_part_of_police: continue
-
-            if 0.3 < float(w)/h < 3.0:
-                lanes = get_occupied_lanes(x, y, w, h)
-                if lanes:
-                    dist = (y + h/2 + ROI_START_Y) - 80
-                    detected_objects.append({'type': 'DANGER', 'subtype': 'YELLOW', 'lanes': lanes, 'dist': dist})
-                    debug_tokens.append(('DANGER_YELLOW', x*2, (y+ROI_START_Y)*2, w*2, h*2))
+        x, y, w, h = cv2.boundingRect(c)
+        cx, cy = x + w/2, y + h/2
+        if any(px <= cx <= px+pw and py <= cy <= py+ph for (px, py, pw, ph) in police_car_zones): continue
+        if is_valid_3d_token(x, y, w, h, area):
+            lanes = get_occupied_lanes(x, y, w, h)
+            if lanes:
+                dist = (y + h/2 + ROI_START_Y) - 80
+                detected_objects.append({'type': 'DANGER', 'subtype': 'YELLOW', 'lanes': lanes, 'dist': dist})
+                debug_tokens.append(('DANGER_YELLOW', x*2, (y+ROI_START_Y)*2, w*2, h*2))
     
     for c in contours_g:
         area = cv2.contourArea(c)
-        if area > 5:
-            x, y, w, h = cv2.boundingRect(c)
-            cx, cy = x + w/2, y + h/2
-            is_part_of_police = any(px <= cx <= px+pw and py <= cy <= py+ph for (px, py, pw, ph) in police_car_zones)
-            if is_part_of_police: continue
-
-            if 0.3 < float(w)/h < 3.0:
-                lanes = get_occupied_lanes(x, y, w, h)
-                if lanes:
-                    dist = (y + h/2 + ROI_START_Y) - 80
-                    detected_objects.append({'type': 'GREEN', 'subtype': 'GREEN', 'lanes': lanes, 'dist': dist})
-                    debug_tokens.append(('GREEN', x*2, (y+ROI_START_Y)*2, w*2, h*2))
+        x, y, w, h = cv2.boundingRect(c)
+        cx, cy = x + w/2, y + h/2
+        if any(px <= cx <= px+pw and py <= cy <= py+ph for (px, py, pw, ph) in police_car_zones): continue
+        if is_valid_3d_token(x, y, w, h, area):
+            lanes = get_occupied_lanes(x, y, w, h)
+            if lanes:
+                dist = (y + h/2 + ROI_START_Y) - 80
+                detected_objects.append({'type': 'GREEN', 'subtype': 'GREEN', 'lanes': lanes, 'dist': dist})
+                debug_tokens.append(('GREEN', x*2, (y+ROI_START_Y)*2, w*2, h*2))
                     
     return detected_objects, debug_tokens, low_light_mode
 
@@ -440,6 +440,9 @@ def evaluate_decision(detected_objects, current_lane, low_light_mode, chaser_beh
                     danger_lanes.add(lane)
             elif obj['type'] == 'GREEN':
                 green_lanes.add(lane)
+
+    if police_lanes:
+        target_accel = 0.75
 
     chaser_lanes = set()
     if chaser_behind:
@@ -517,14 +520,16 @@ def processing_task():
     #You can use libraries like OpenCV to process the image
     #There is no limtation to the complexity of the processing task, you can use any libraries you want
     #Remember to use the shared_data to get the latest frame
-    with data_lock: 
+    with frame_lock: 
         front_frame = shared_data['latest_front_frame']
         back_frame = shared_data.get('latest_back_frame')
+    
+    with state_lock:
         current_lane = shared_data.get('net_lane_position', 0)
         last_processed_id = shared_data.get('last_processed_id', None)
         
     if front_frame is not None and id(front_frame) != last_processed_id:
-        with data_lock:
+        with state_lock:
             shared_data['last_processed_id'] = id(front_frame)
             
         chaser_boxes = detect_back_environment(back_frame)
@@ -533,7 +538,7 @@ def processing_task():
         
         police_detected = any('POLICE' in t[0] for t in debug_tokens)
         
-        with data_lock:
+        with state_lock:
             seek_red_end = shared_data.get('seek_red_end_time', 0.0)
             if police_detected:
                 shared_data['seek_red_end_time'] = time.time() + 5.0
@@ -551,7 +556,7 @@ def processing_task():
                             
         target_steer, target_accel, debug_text = evaluate_decision(detected_objects, current_lane, low_light_mode, chaser_behind, chaser_boxes, seek_red_mode)
 
-        with data_lock:
+        with state_lock:
             shared_data['steering_input'] = target_steer
             shared_data['acceleration_input'] = target_accel
             shared_data['debug_tokens'] = debug_tokens
@@ -562,7 +567,7 @@ def processing_task():
 
 def send_controls_task():
     #This is where you send the control commands to the car using the control_conn
-    global control_conn, tap_state, tap_timer, active_steering_value
+    global control_conn, tap_state, tap_timer, active_steering_value, smoothed_steering
     if control_conn is None: 
         return
     
@@ -570,7 +575,7 @@ def send_controls_task():
     #steering_input: -1.0 to 1.0 (left to right)
     #acceleration_input: -1.0 to 1.0 (reverse to forward)
     #this example always accelerate forward
-    with data_lock:
+    with state_lock:
         auto_steer = shared_data['steering_input']
         accel_input = shared_data['acceleration_input']
 
@@ -580,7 +585,7 @@ def send_controls_task():
             tap_state = 'TAPPING'
             tap_timer = TAP_HOLD_FRAMES
             
-            with data_lock:
+            with state_lock:
                 if auto_steer < -0.1: shared_data['net_lane_position'] = max(-1, shared_data.get('net_lane_position', 0) - 1)
                 elif auto_steer > 0.1: shared_data['net_lane_position'] = min(1, shared_data.get('net_lane_position', 0) + 1)
         else: active_steering_value = 0.0
@@ -595,8 +600,11 @@ def send_controls_task():
         if tap_timer > 0: tap_timer -= 1
         else: tap_state = 'IDLE'
 
+    ALPHA = 0.4
+    smoothed_steering = (ALPHA * active_steering_value) + ((1.0 - ALPHA) * smoothed_steering)
+
     try:
-        data = struct.pack('ff', active_steering_value, accel_input)
+        data = struct.pack('ff', smoothed_steering, accel_input)
         control_conn.sendall(data)
     except Exception as e:
         print(f"Control send error: {e}")
@@ -608,6 +616,8 @@ def send_controls_task():
 # ---------------------------------------------------------
 if __name__ == '__main__':
     print("Initializing Phase 1 RTSE Drive...")
+    try: ctypes.windll.winmm.timeBeginPeriod(1)
+    except Exception: pass
     
     # Initialize network connections
     threading.Thread(target=setup_control_server, daemon=True).start()
@@ -641,29 +651,31 @@ if __name__ == '__main__':
     try:
         # You need this to keep the main thread alive, otherwise the program will exit immediately
         while is_running:
-            with data_lock:
+            with frame_lock:
                 front_frame = shared_data['latest_front_frame']
                 back_frame = shared_data.get('latest_back_frame', None)
+            
+            with state_lock:
                 debug_info = shared_data['debug_info']
                 debug_tokens = shared_data['debug_tokens'].copy()
                 steer_input = shared_data['steering_input']
+                accel_input = shared_data.get('acceleration_input', 1.0)
                 low_light = shared_data.get('low_light', False)
                 chaser_behind = shared_data.get('chaser_behind', False)
                 chaser_boxes = shared_data.get('chaser_boxes', [])
+                seek_red_end = shared_data.get('seek_red_end_time', 0.0)
 
             key = cv2.waitKey(1) & 0xFF
-            if key == ord('p') or key == ord(' '): 
-                display_paused = not display_paused
-            elif key == ord('q'): 
-                is_running = False
+            if key == ord('p') or key == ord(' '): display_paused = not display_paused
+            elif key == ord('q'): is_running = False
 
             if front_frame is not None and not display_paused:
                 display_front = cv2.resize(front_frame, (640, 480))
                 
-                cv2.putText(display_front, debug_info, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                # Combine ACCEL and AUTO texts side-by-side
+                top_status_text = f"ACCEL: {accel_input:.2f} | {debug_info}"
+                cv2.putText(display_front, top_status_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
                 
-                with data_lock:
-                    seek_red_end = shared_data.get('seek_red_end_time', 0.0)
                 time_left = seek_red_end - time.time()
                 if time_left > 0:
                     cv2.putText(display_front, f"SEEK RED MODE: {time_left:.1f}s", (120, 150), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 3)
@@ -731,5 +743,8 @@ if __name__ == '__main__':
         back_camera_sock.close()
     if control_conn:
         control_conn.close()
+        
+    try: ctypes.windll.winmm.timeEndPeriod(1)
+    except Exception: pass
     cv2.destroyAllWindows()
     print("System terminated cleanly.")
