@@ -354,8 +354,11 @@ def detect_environment(front_frame):
                 light_aspect = light_w / max(1.0, float(light_h))
                 
                 if light_w < 120 and light_aspect > 1.2:
-                    car_x, car_w = max(0, light_x - int(light_w * 0.1)), int(light_w * 1.2)
-                    car_y, car_h = max(0, light_y - int(light_h * 0.2)), int(light_h * 4.0)
+                    pad_x = int(light_w * 0.5)
+                    car_x = max(0, light_x - pad_x)
+                    car_w = int(light_w * 2.0)
+                    car_y = max(0, light_y - int(light_h * 0.2))
+                    car_h = int(light_h * 4.0)
                     police_car_zones.append((car_x, car_y, car_w, car_h))
                     lanes = get_occupied_lanes(car_x, car_y, car_w, car_h)
                     if lanes:
@@ -493,9 +496,20 @@ def evaluate_decision(detected_objects, current_lane, low_light_mode, chaser_beh
             return 1.0, target_accel, "SEEKING RED RIGHT >>"
 
     if 0 in danger_lanes:
-        if -1 not in danger_lanes and -1 not in police_lanes:
+        safe_left = -1 not in danger_lanes and -1 not in police_lanes
+        safe_right = 1 not in danger_lanes and 1 not in police_lanes
+
+        if safe_left and safe_right:
+            # Both sides are safe. Actively look for a reason to pick one over the other.
+            if 1 in green_lanes: 
+                return 1.0, target_accel, "EVADE RIGHT (TO GREEN) >>"
+            elif -1 in green_lanes: 
+                return -1.0, target_accel, "<< EVADE LEFT (TO GREEN)"
+            else:
+                return -1.0, target_accel, "<< EVADE LEFT (DEFAULT)" # Fallback
+        elif safe_left:
             return -1.0, target_accel, "<< EVADE LEFT"
-        elif 1 not in danger_lanes and 1 not in police_lanes:
+        elif safe_right:
             return 1.0, target_accel, "EVADE RIGHT >>"
         else:
             return 1.0, target_accel, "TRAPPED! PUSH RIGHT >>"
@@ -578,6 +592,7 @@ def send_controls_task():
     with state_lock:
         auto_steer = shared_data['steering_input']
         accel_input = shared_data['acceleration_input']
+        is_emergency = shared_data.get('chaser_behind', False)
 
     if tap_state == 'IDLE':
         if auto_steer != 0.0:
@@ -594,13 +609,13 @@ def send_controls_task():
         else:
             active_steering_value = 0.0
             tap_state = 'COOLDOWN'
-            tap_timer = COOLDOWN_FRAMES
+            tap_timer = 2 if is_emergency else COOLDOWN_FRAMES
     elif tap_state == 'COOLDOWN':
         active_steering_value = 0.0
         if tap_timer > 0: tap_timer -= 1
         else: tap_state = 'IDLE'
 
-    ALPHA = 0.4
+    ALPHA = 1.0 if is_emergency else 0.4
     smoothed_steering = (ALPHA * active_steering_value) + ((1.0 - ALPHA) * smoothed_steering)
 
     try:
