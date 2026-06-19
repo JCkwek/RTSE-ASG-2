@@ -466,7 +466,11 @@ def evaluate_decision(detected_objects, current_lane, low_light_mode, chaser_beh
             elif obj['type'] == 'GREEN': green_lanes.add(lane)
 
     # --- Longitudinal channel (accel), decoupled from steering ---
-    if low_light_mode: target_accel = -1.0       # EV1: full brake
+    # Outrunning the homing chaser needs speed: flooring it overrides both the
+    # darkness brake and the police ease-off. (Braking while a chaser homes in
+    # gets the car caught -- confirmed in testing.)
+    if chaser_behind: target_accel = 1.0
+    elif low_light_mode: target_accel = -1.0     # EV1: full brake
     elif police_lanes: target_accel = 0.75       # ease off near the police car
     else: target_accel = 1.0
 
@@ -494,7 +498,7 @@ def evaluate_decision(detected_objects, current_lane, low_light_mode, chaser_beh
         elif -1 in red_lanes and -1 not in police_lanes and current_lane > -2: return -1.0, target_accel, "<< SEEKING RED LEFT"
         elif 1 in red_lanes and 1 not in police_lanes and current_lane < 2: return 1.0, target_accel, "SEEKING RED RIGHT >>"
 
-    # --- P1: chaser evade (sweep). accel stays braked in darkness => brake + weave ---
+    # --- P1: chaser evade (sweep). accel already forced to 1.0 above (floor it) ---
     if chaser_behind:
         # Police lanes are hard-blocked (game over); danger/red lanes are a last
         # resort so the car escapes rather than freezing when boxed in.
