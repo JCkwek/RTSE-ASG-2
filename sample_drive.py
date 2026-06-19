@@ -6,12 +6,12 @@ import numpy as np
 import time
 import select
 import ctypes
-import re
 import os
 
 from chaser_logic import chaser_box_metrics
 from decision_logic import evaluate_decision
 from lane_geometry import occupied_lanes, fit_road_model, model_from_bounds
+from ocr_parsing import parse_lane
 
 try:
     import pytesseract
@@ -230,6 +230,18 @@ def read_back_camera_task(): read_single_camera(back_camera_sock, 'latest_back_f
 # ------------------------------------
 # OCR Golden Lane Scanner Task
 # ------------------------------------
+# EV5 OCR tunables. Tune these IN-GAME against the debug overlay during a golden
+# flash: watch the bottom "golden mask" strip and the "OCR EXTR" text.
+#  - If the mask strip is blank during a flash -> the flash is OUTSIDE GOLDEN_CROP
+#    or not in this color: widen/move GOLDEN_CROP, or adjust GOLDEN_YELLOW_LO/HI.
+#  - If the mask shows the text but OCR EXTR is wrong/empty -> OCR problem (parsing
+#    is already tolerant via ocr_parsing.parse_lane).
+GOLDEN_CROP = (0.0, 0.30, 0.05, 0.95)   # (top, bottom, left, right) as frame fractions
+GOLDEN_YELLOW_LO = (15, 90, 90)         # HSV lower bound for the gold flash text
+GOLDEN_YELLOW_HI = (40, 255, 255)       # HSV upper bound
+GOLDEN_MIN_YELLOW_PX = 12               # min yellow pixels before running OCR
+GOLDEN_LATCH_SEC = 5.5                  # latched lifetime of one detection (vs real 5s)
+
 def ocr_task():
     if not TESSERACT_AVAILABLE: return
     with frame_lock: frame = shared_data.get('latest_front_frame')
@@ -241,30 +253,34 @@ def ocr_task():
 
     try:
         h, w = frame.shape[:2]
-        crop_img = frame[0:int(h * 0.15), int(w * 0.1):int(w * 0.9)]
-        
+        top, bottom, left, right = GOLDEN_CROP
+        crop_img = frame[int(h * top):int(h * bottom), int(w * left):int(w * right)]
+
         hsv = cv2.cvtColor(crop_img, cv2.COLOR_BGR2HSV)
-        mask = cv2.inRange(hsv, np.array([15, 100, 100]), np.array([40, 255, 255]))
-        
+        mask = cv2.inRange(hsv, np.array(GOLDEN_YELLOW_LO), np.array(GOLDEN_YELLOW_HI))
+
         with state_lock: shared_data['debug_golden_mask'] = mask.copy()
-        
-        if cv2.countNonZero(mask) > 15: 
-            mask_large = cv2.resize(mask, (0, 0), fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
-            mask_inv = cv2.bitwise_not(mask_large)
-            mask_padded = cv2.copyMakeBorder(mask_inv, 20, 20, 20, 20, cv2.BORDER_CONSTANT, value=255)
-            
-            text = pytesseract.image_to_string(mask_padded, config='--psm 7').upper()
-            
-            with state_lock: shared_data['debug_ocr_text'] = text.strip()
-            
-            match = re.search(r'LANE\s*([1-5])', text)
-            if match:
-                lane_num = int(match.group(1)) 
-                with state_lock:
-                    shared_data['golden_lane_target'] = lane_num
-                    shared_data['golden_lane_end_time'] = time.time() + 5.5 
-        else:
-            with state_lock: shared_data['debug_ocr_text'] = ""
+
+        yellow_px = cv2.countNonZero(mask)
+        if yellow_px <= GOLDEN_MIN_YELLOW_PX:
+            # Surface WHY nothing was read, so the region/color can be tuned in-game.
+            with state_lock: shared_data['debug_ocr_text'] = f"(yellow px {yellow_px})"
+            return
+
+        mask_large = cv2.resize(mask, (0, 0), fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
+        mask_inv = cv2.bitwise_not(mask_large)
+        mask_padded = cv2.copyMakeBorder(mask_inv, 20, 20, 20, 20, cv2.BORDER_CONSTANT, value=255)
+
+        text = pytesseract.image_to_string(
+            mask_padded, config='--psm 7 -c tessedit_char_whitelist=LANEGOLD0123456789: '
+        ).upper()
+        with state_lock: shared_data['debug_ocr_text'] = text.strip()
+
+        lane_num = parse_lane(text)
+        if lane_num:
+            with state_lock:
+                shared_data['golden_lane_target'] = lane_num
+                shared_data['golden_lane_end_time'] = time.time() + GOLDEN_LATCH_SEC
     except Exception: pass
 
 # ---------------------------------------------------------
