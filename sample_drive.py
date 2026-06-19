@@ -339,7 +339,6 @@ def detect_environment(front_frame):
     mask_red1 = cv2.inRange(roi_hsv, np.array([0, 100, 80]), np.array([10, 255, 255]))
     mask_red2 = cv2.inRange(roi_hsv, np.array([170, 100, 80]), np.array([180, 255, 255]))
     mask_red = mask_red1 | mask_red2
-    mask_yellow = cv2.inRange(roi_hsv, np.array([10, 100, 100]), np.array([40, 255, 255]))
     mask_blue = cv2.inRange(roi_hsv, np.array([90, 100, 100]), np.array([135, 255, 255]))
     mask_white = cv2.inRange(roi_hsv, np.array([0, 0, 180]), np.array([180, 45, 255]))
     
@@ -375,12 +374,10 @@ def detect_environment(front_frame):
 
     mask_green = cv2.morphologyEx(mask_green, cv2.MORPH_OPEN, morph_kernel)
     mask_red = cv2.morphologyEx(mask_red, cv2.MORPH_OPEN, morph_kernel)
-    mask_yellow = cv2.morphologyEx(mask_yellow, cv2.MORPH_OPEN, morph_kernel)
     mask_blue = cv2.morphologyEx(mask_blue, cv2.MORPH_OPEN, morph_kernel)
 
     contours_g, _ = cv2.findContours(mask_green, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     contours_red, _ = cv2.findContours(mask_red, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    contours_yellow, _ = cv2.findContours(mask_yellow, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     contours_blue, _ = cv2.findContours(mask_blue, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
     detected_objects, debug_tokens = [], []
@@ -435,16 +432,17 @@ def detect_environment(front_frame):
                 detected_objects.append({'type': 'DANGER', 'subtype': 'RED', 'lanes': lanes, 'dist': (y + h/2 + ROI_START_Y) - 80})
                 debug_tokens.append(('DANGER_RED', x, y, w, h))
 
-    for contour_list, t_type, sub_type in [(contours_yellow, 'DANGER', 'YELLOW'), (contours_g, 'GREEN', 'GREEN')]:
-        for c in contour_list:
-            area, x, y, w, h = cv2.contourArea(c), *cv2.boundingRect(c)
-            cx, cy = x + w/2, y + h/2
-            if any(px <= cx <= px+pw and py <= cy <= py+ph for (px, py, pw, ph) in police_car_zones): continue
-            if is_valid_3d_token(x, y, w, h, area):
-                lanes = get_occupied_lanes(x, y, w, h)
-                if lanes:
-                    detected_objects.append({'type': t_type, 'subtype': sub_type, 'lanes': lanes, 'dist': (y + h/2 + ROI_START_Y) - 80})
-                    debug_tokens.append((sub_type, x, y, w, h))
+    # Yellow tokens are NEUTRAL (net = green - red), so they are not avoided.
+    # Only green is harvested here; red is handled above as danger.
+    for c in contours_g:
+        area, x, y, w, h = cv2.contourArea(c), *cv2.boundingRect(c)
+        cx, cy = x + w/2, y + h/2
+        if any(px <= cx <= px+pw and py <= cy <= py+ph for (px, py, pw, ph) in police_car_zones): continue
+        if is_valid_3d_token(x, y, w, h, area):
+            lanes = get_occupied_lanes(x, y, w, h)
+            if lanes:
+                detected_objects.append({'type': 'GREEN', 'subtype': 'GREEN', 'lanes': lanes, 'dist': (y + h/2 + ROI_START_Y) - 80})
+                debug_tokens.append(('GREEN', x, y, w, h))
     return detected_objects, debug_tokens, low_light_mode, best_road_bounds
 
 # ---------------------------------------------------------
@@ -515,7 +513,7 @@ def evaluate_decision(detected_objects, current_lane, low_light_mode, chaser_beh
     if low_light_mode:
         return 0.0, target_accel, "LOW LIGHT: BRAKING STRAIGHT"
 
-    # --- P2: evade danger (red/yellow), preferring a green-ward escape ---
+    # --- P2: evade danger (red only -- yellow is neutral), preferring a green-ward escape ---
     if 0 in danger_lanes:
         safe_left = (-1 not in danger_lanes) and (-1 not in police_lanes) and (current_lane > -2)
         safe_right = (1 not in danger_lanes) and (1 not in police_lanes) and (current_lane < 2)
