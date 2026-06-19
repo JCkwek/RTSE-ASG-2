@@ -36,6 +36,27 @@ class TestChooseChaserEvade(unittest.TestCase):
         steer, _, _ = choose_chaser_evade(2, 1, {-1})
         self.assertEqual(steer, 0.0)
 
+    def test_prefers_clean_lane_over_soft_blocked(self):
+        # Right (+1) has a danger token (soft), left (-1) is clean -> take left.
+        steer, new_dir, _ = choose_chaser_evade(0, 1, hard_blocked=set(), soft_blocked={1})
+        self.assertEqual((steer, new_dir), (-1.0, -1))
+
+    def test_uses_soft_blocked_as_last_resort(self):
+        # Left (-1) is police (hard), right (+1) has danger (soft).
+        # Must take the danger lane rather than freeze -- never the police lane.
+        steer, new_dir, text = choose_chaser_evade(0, 1, hard_blocked={-1}, soft_blocked={1})
+        self.assertEqual((steer, new_dir), (1.0, 1))
+        self.assertIn("RISK", text)
+
+    def test_never_enters_hard_blocked_even_when_only_option(self):
+        # Right (+1) police (hard), left (-1) danger (soft) -> take soft left.
+        steer, new_dir, _ = choose_chaser_evade(0, 1, hard_blocked={1}, soft_blocked={-1})
+        self.assertEqual((steer, new_dir), (-1.0, -1))
+
+    def test_trapped_when_both_sides_hard_blocked(self):
+        steer, _, _ = choose_chaser_evade(0, 1, hard_blocked={-1, 1}, soft_blocked={-1, 1})
+        self.assertEqual(steer, 0.0)
+
 
 class TestChaserBoxMetrics(unittest.TestCase):
     def test_centered_far_box_is_center_side_low_proximity(self):

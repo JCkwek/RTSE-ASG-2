@@ -8,26 +8,34 @@ LANE_MIN = -2
 LANE_MAX = 2
 
 
-def choose_chaser_evade(current_lane, evade_dir, blocked):
-    """Continuous sweep/weave chooser.
+def choose_chaser_evade(current_lane, evade_dir, hard_blocked, soft_blocked=None):
+    """Continuous sweep/weave chooser with two-tier lane blocking.
 
     current_lane: int in [LANE_MIN, LANE_MAX] (net_lane_position).
     evade_dir:    int, -1 or +1, the current sweep direction.
-    blocked:      set of RELATIVE lane offsets that are unsafe (police/danger).
+    hard_blocked: RELATIVE offsets that must NEVER be entered (police -> game over).
+    soft_blocked: RELATIVE offsets to avoid UNLESS no clean lane exists
+                  (danger/red tokens -- a clip is better than a chaser hit).
 
     Returns (steer, new_evade_dir, debug_text):
       steer:         float in {-1.0, 0.0, 1.0}
       new_evade_dir: int -1/+1 (reversed if we had to turn around)
       debug_text:    str
+
+    Pass 1 prefers a fully clear lane; pass 2 accepts a soft-blocked lane as a
+    last resort. A hard-blocked lane is never entered.
     """
-    for d in (evade_dir, -evade_dir):
-        target = current_lane + d
-        if target < LANE_MIN or target > LANE_MAX:
-            continue  # would run off the track on this side
-        if d in blocked:
-            continue  # adjacent lane this way is unsafe
-        text = "<< SWEEP CHASER LEFT" if d < 0 else "SWEEP CHASER RIGHT >>"
-        return float(d), d, text
+    if soft_blocked is None:
+        soft_blocked = set()
+    for avoid, suffix in ((hard_blocked | soft_blocked, ""), (hard_blocked, " (RISK)")):
+        for d in (evade_dir, -evade_dir):
+            target = current_lane + d
+            if target < LANE_MIN or target > LANE_MAX:
+                continue  # would run off the track on this side
+            if d in avoid:
+                continue
+            base = "<< SWEEP CHASER LEFT" if d < 0 else "SWEEP CHASER RIGHT >>"
+            return float(d), d, base + suffix
     return 0.0, evade_dir, "CHASER TRAPPED! FLOOR IT"
 
 
