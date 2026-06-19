@@ -78,6 +78,11 @@ EMERGENCY_COOLDOWN_FRAMES = 2 # near-zero cooldown during chaser evasion
 GOLDEN_COMMIT_SEC = 2.5       # commit to golden lane for the final part of the
                               # 5.5s OCR latch; wide enough to cover the real EV5
                               # expiry despite OCR read lag (tune vs. EV5 hit rate)
+MAX_RED_TOKEN_AREA = 130      # reds bigger than this are treated as the police
+                              # CAR (never driven into), not a collectible token.
+                              # Lower if police still gets hit; raise if real red
+                              # tokens stop being collected (EV2). Read live sizes
+                              # off the "RED:<area>" overlay labels to tune.
 evade_dir = 1                 # current sweep direction (-1 left / +1 right)
 
 # Morphology Kernel
@@ -432,8 +437,8 @@ def detect_environment(front_frame):
         if is_valid_3d_token(x, y, w, h, area):
             lanes = get_occupied_lanes(x, y, w, h)
             if lanes:
-                detected_objects.append({'type': 'DANGER', 'subtype': 'RED', 'lanes': lanes, 'dist': (y + h/2 + ROI_START_Y) - 80})
-                debug_tokens.append(('DANGER_RED', x, y, w, h))
+                detected_objects.append({'type': 'DANGER', 'subtype': 'RED', 'lanes': lanes, 'dist': (y + h/2 + ROI_START_Y) - 80, 'area': area})
+                debug_tokens.append((f'RED:{int(area)}', x, y, w, h))
 
     # Yellow tokens are NEUTRAL (net = green - red), so they are not avoided.
     # Only green is harvested here; red is handled above as danger.
@@ -461,8 +466,14 @@ def evaluate_decision(detected_objects, current_lane, low_light_mode, chaser_beh
             if obj['type'] == 'DANGER':
                 if obj.get('subtype') == 'POLICE': police_lanes.add(lane)
                 elif obj.get('subtype') == 'RED':
-                    red_lanes.add(lane)
-                    if not seek_red_mode: danger_lanes.add(lane)
+                    # A collectible red is small; a large red blob is the police
+                    # CAR body -> never seek it, always avoid (prevents the
+                    # seek-red-into-police game over).
+                    is_token = obj.get('area', 0) <= MAX_RED_TOKEN_AREA
+                    if seek_red_mode and is_token:
+                        red_lanes.add(lane)
+                    else:
+                        danger_lanes.add(lane)
                 else: danger_lanes.add(lane)
             elif obj['type'] == 'GREEN': green_lanes.add(lane)
 
@@ -586,8 +597,10 @@ def processing_task():
             seek_red_mode = time.time() < seek_red_end
             if seek_red_mode:
                 for obj in detected_objects:
-                    if obj.get('subtype') == 'RED' and 0 in obj['lanes']:
-                        if obj['dist'] > -5: 
+                    # Only a small red TOKEN counts as collected -- a large red
+                    # (police car body) ahead must not end the seek.
+                    if obj.get('subtype') == 'RED' and 0 in obj['lanes'] and obj.get('area', 0) <= MAX_RED_TOKEN_AREA:
+                        if obj['dist'] > -5:
                             shared_data['seek_red_end_time'] = 0.0
                             seek_red_mode = False
                             break
@@ -770,7 +783,7 @@ if __name__ == '__main__':
                 for token_data in debug_tokens:
                     if len(token_data) >= 5:
                         ttype, x, y, w, h = token_data[:5]
-                        color = (255, 0, 0) if 'POLICE' in ttype else ((0, 0, 255) if 'DANGER' in ttype else (0, 255, 0))
+                        color = (255, 0, 0) if 'POLICE' in ttype else ((0, 0, 255) if ('DANGER' in ttype or 'RED' in ttype) else (0, 255, 0))
                         disp_x, disp_y = x * 2, (y + ROI_START_Y) * 2
                         disp_w, disp_h = w * 2, h * 2
                         cv2.rectangle(display_front, (disp_x, disp_y), (disp_x + disp_w, disp_y + disp_h), color, 2)
