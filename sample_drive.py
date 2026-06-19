@@ -11,6 +11,7 @@ import os
 
 from chaser_logic import chaser_box_metrics
 from decision_logic import evaluate_decision
+from lane_geometry import occupied_lanes
 
 try:
     import pytesseract
@@ -271,23 +272,11 @@ def ocr_task():
 # ---------------------------------------------------------
 ROI_START_Y = 100
 
-def get_occupied_lanes(x, y, w, h):
-    actual_y = y + h/2 + ROI_START_Y
-    dist_to_horizon = actual_y - 80 
-    if dist_to_horizon <= 0: return []
-    
-    lane_width = dist_to_horizon * 0.44 
-    if lane_width <= 0: return []
-
-    cx = x + w/2
-    rel_lane = round((cx - 160) / lane_width)
-    
-    lanes = [max(-2, min(2, int(rel_lane)))]
-    if w > lane_width * 1.5:
-        lanes.append(max(-2, min(2, int(rel_lane)-1)))
-        lanes.append(max(-2, min(2, int(rel_lane)+1)))
-
-    return list(set(lanes))
+def get_occupied_lanes(x, y, w, h, road_bounds=None):
+    # Classify against the MEASURED road (road_bounds) when available so decisions
+    # match the on-screen lane grid; falls back to a fixed model when no curbs are
+    # seen. Pure math lives in lane_geometry.occupied_lanes (unit-tested).
+    return occupied_lanes(x + w/2.0, y + h/2.0, w, road_bounds, ROI_START_Y)
 
 def detect_back_environment(back_frame):
     if back_frame is None: return [], 0.0, 0
@@ -426,7 +415,7 @@ def detect_environment(front_frame):
                     car_y, car_h = max(0, light_y - int(light_h * 0.2)), int(light_h * 4.0)
                     police_car_zones.append((car_x, car_y, car_w, car_h))
                     
-                    lanes = get_occupied_lanes(car_x, car_y, car_w, car_h)
+                    lanes = get_occupied_lanes(car_x, car_y, car_w, car_h, best_road_bounds)
                     if lanes:
                         detected_objects.append({'type': 'DANGER', 'subtype': 'POLICE', 'lanes': lanes, 'dist': (car_y + car_h/2 + ROI_START_Y) - 80})
                         debug_tokens.append(('POLICE', car_x, car_y, car_w, car_h))
@@ -437,7 +426,7 @@ def detect_environment(front_frame):
         if any(px <= cx <= px+pw and py <= cy <= py+ph for (px, py, pw, ph) in police_car_zones): continue
         area = red_areas[(x, y, w, h)]
         if is_valid_3d_token(x, y, w, h, area):
-            lanes = get_occupied_lanes(x, y, w, h)
+            lanes = get_occupied_lanes(x, y, w, h, best_road_bounds)
             if lanes:
                 detected_objects.append({'type': 'DANGER', 'subtype': 'RED', 'lanes': lanes, 'dist': (y + h/2 + ROI_START_Y) - 80, 'area': area})
                 debug_tokens.append((f'RED:{int(area)}', x, y, w, h))
@@ -449,7 +438,7 @@ def detect_environment(front_frame):
         cx, cy = x + w/2, y + h/2
         if any(px <= cx <= px+pw and py <= cy <= py+ph for (px, py, pw, ph) in police_car_zones): continue
         if is_valid_3d_token(x, y, w, h, area):
-            lanes = get_occupied_lanes(x, y, w, h)
+            lanes = get_occupied_lanes(x, y, w, h, best_road_bounds)
             if lanes:
                 detected_objects.append({'type': 'GREEN', 'subtype': 'GREEN', 'lanes': lanes, 'dist': (y + h/2 + ROI_START_Y) - 80})
                 debug_tokens.append(('GREEN', x, y, w, h))
