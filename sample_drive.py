@@ -9,6 +9,8 @@ import ctypes
 import re
 import os
 
+from chaser_logic import choose_chaser_evade, chaser_box_metrics
+
 try:
     import pytesseract
     TESSERACT_AVAILABLE = True
@@ -45,6 +47,9 @@ shared_data = {
     'low_light': False,
     'chaser_behind': False,
     'chaser_boxes': [],
+    'chaser_evade_end_time': 0.0,
+    'chaser_proximity': 0.0,
+    'chaser_side': 0,
     'seek_red_end_time': 0.0,
     'golden_lane_target': 0,
     'golden_lane_end_time': 0.0,
@@ -58,8 +63,16 @@ tap_state = 'IDLE'
 tap_timer = 0
 active_steering_value = 0.0
 smoothed_steering = 0.0      
-TAP_HOLD_FRAMES = 12         
-COOLDOWN_FRAMES = 15         
+TAP_HOLD_FRAMES = 12
+COOLDOWN_FRAMES = 15
+
+# --- Chaser evasion tunables (EV3/EV4) ---
+MIN_CHASER_AREA = 12          # rear-mask noise floor (320x240 space)
+CHASER_EVADE_LATCH_SEC = 0.6  # keep evading through 1-frame detection dropouts
+CHASER_CLOSE_PROXIMITY = 0.6  # >= this => escalate (never coast)
+EMERGENCY_TAP_HOLD_FRAMES = 7 # shorter hold so lane changes chain into a weave
+EMERGENCY_COOLDOWN_FRAMES = 2 # near-zero cooldown during chaser evasion
+evade_dir = 1                 # current sweep direction (-1 left / +1 right)
 
 # Morphology Kernel
 morph_kernel = np.ones((3, 3), np.uint8)
@@ -264,27 +277,31 @@ def get_occupied_lanes(x, y, w, h):
     return list(set(lanes))
 
 def detect_back_environment(back_frame):
-    if back_frame is None: return []
+    if back_frame is None: return [], 0.0, 0
     small_frame = cv2.resize(back_frame, (320, 240))
-    roi_back = small_frame[130:240, 40:280] 
+    roi_back = small_frame[130:240, 40:280]
     roi_hsv = cv2.cvtColor(roi_back, cv2.COLOR_BGR2HSV)
     mask_car = cv2.inRange(roi_hsv, np.array([85, 150, 80]), np.array([130, 255, 255]))
     mask_car = cv2.morphologyEx(mask_car, cv2.MORPH_OPEN, morph_kernel)
     contours, _ = cv2.findContours(mask_car, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    
-    chaser_boxes = []
+
+    # Pick the LARGEST valid contour (the closest/real chaser), not the first.
+    best_rect = None
+    best_area = 0.0
     for c in contours:
         area = cv2.contourArea(c)
-        x, y, w, h = cv2.boundingRect(c)
-        if area > 0 or w >= 1 or h >= 1:
-            car_x, car_y = x + 40, y + 130
-            scale = max(0.1, min(1.0, (car_y - 120) / 120.0)) 
-            box_w, box_h = int(140 * scale), int(60 * scale)
-            center_x, center_y = car_x + w/2, car_y + h/2
-            final_x, final_y = int(center_x - box_w/2), int(center_y - box_h/2)
-            chaser_boxes.append((final_x, final_y, box_w, box_h))
-            break 
-    return chaser_boxes
+        if area < MIN_CHASER_AREA:
+            continue
+        if area > best_area:
+            best_area = area
+            best_rect = cv2.boundingRect(c)
+
+    if best_rect is None:
+        return [], 0.0, 0
+
+    x, y, w, h = best_rect
+    final_box, proximity, side = chaser_box_metrics(x, y, w, h)
+    return [final_box], proximity, side
 
 def is_valid_3d_token(x, y, w, h, area):
     if area < 5: return False
@@ -454,14 +471,6 @@ def evaluate_decision(detected_objects, current_lane, low_light_mode, chaser_beh
 
     if police_lanes: target_accel = 0.75
 
-    chaser_lanes = set()
-    if chaser_behind:
-        for (cx, cy, cw, ch) in chaser_boxes:
-            center_x = cx + cw / 2.0
-            if center_x < 130: chaser_lanes.add(-1)
-            elif center_x > 190: chaser_lanes.add(1)
-            else: chaser_lanes.add(0)
-
     # Golden lane event reaction
     if golden_mode and 1 <= golden_target <= 5:
         rel_golden = golden_target - (current_lane + 3)
@@ -478,18 +487,12 @@ def evaluate_decision(detected_objects, current_lane, low_light_mode, chaser_beh
         elif current_lane < 2: return 1.0, target_accel, "EVADE POLICE RIGHT (RISK) >>"
         else: return 0.0, 0.5, "TRAPPED BY POLICE"
 
-    if chaser_behind and 0 in chaser_lanes:
-        target_accel = 1.0 
-        safe_lanes = [l for l in [-1, 0, 1] if l not in police_lanes and l not in danger_lanes and l not in chaser_lanes and -2 <= current_lane + l <= 2]
-        if safe_lanes: best_lane = min(safe_lanes, key=lambda l: abs(l))
-        else:
-            semi_safe = [l for l in [-1, 0, 1] if l not in police_lanes and l not in chaser_lanes and -2 <= current_lane + l <= 2]
-            if semi_safe: best_lane = min(semi_safe, key=lambda l: abs(l))
-            else: best_lane = 0 
-        
-        if best_lane < 0: return -1.0, target_accel, "<< DODGE CHASER LEFT"
-        elif best_lane > 0: return 1.0, target_accel, "DODGE CHASER RIGHT >>"
-        else: return 0.0, target_accel, "CHASER IMMINENT! FLOOR IT!"
+    if chaser_behind:
+        global evade_dir
+        target_accel = 1.0
+        blocked = police_lanes | danger_lanes
+        steer, evade_dir, text = choose_chaser_evade(current_lane, evade_dir, blocked)
+        return steer, target_accel, text
 
     if seek_red_mode and red_lanes:
         if 0 in red_lanes and 0 not in police_lanes: return 0.0, target_accel, "SEEKING RED AHEAD"
@@ -524,8 +527,8 @@ def processing_task():
     #You can use libraries like OpenCV to process the image
     #There is no limtation to the complexity of the processing task, you can use any libraries you want
     #Remember to use the shared_data to get the latest frame
-    global tap_state
-    with frame_lock: 
+    global tap_state, evade_dir
+    with frame_lock:
         front_frame = shared_data['latest_front_frame']
         back_frame = shared_data.get('latest_back_frame')
     
@@ -537,8 +540,19 @@ def processing_task():
         with state_lock:
             shared_data['last_processed_id'] = id(front_frame)
             
-        chaser_boxes = detect_back_environment(back_frame)
-        chaser_behind = len(chaser_boxes) > 0
+        chaser_boxes, chaser_proximity, chaser_side = detect_back_environment(back_frame)
+        chaser_detected = len(chaser_boxes) > 0
+        now = time.time()
+        with state_lock:
+            was_latched = now < shared_data.get('chaser_evade_end_time', 0.0)
+            if chaser_detected:
+                shared_data['chaser_evade_end_time'] = now + CHASER_EVADE_LATCH_SEC
+                shared_data['chaser_proximity'] = chaser_proximity
+                shared_data['chaser_side'] = chaser_side
+                if not was_latched:
+                    # Fresh chaser: start the sweep AWAY from where it is.
+                    evade_dir = -1 if chaser_side > 0 else 1
+            chaser_behind = now < shared_data.get('chaser_evade_end_time', 0.0)
         detected_objects, debug_tokens, low_light_mode, road_bounds = detect_environment(front_frame)
         
         with state_lock:
@@ -597,7 +611,7 @@ def send_controls_task():
         if auto_steer != 0.0:
             active_steering_value = auto_steer
             tap_state = 'TAPPING'
-            tap_timer = TAP_HOLD_FRAMES
+            tap_timer = EMERGENCY_TAP_HOLD_FRAMES if is_emergency else TAP_HOLD_FRAMES
 
             with state_lock:
                 if auto_steer < -0.1: shared_data['net_lane_position'] = max(-2, shared_data.get('net_lane_position', 0) - 1)
@@ -608,7 +622,7 @@ def send_controls_task():
         else:
             active_steering_value = 0.0
             tap_state = 'COOLDOWN'
-            tap_timer = 2 if is_emergency else COOLDOWN_FRAMES
+            tap_timer = EMERGENCY_COOLDOWN_FRAMES if is_emergency else COOLDOWN_FRAMES
     elif tap_state == 'COOLDOWN':
         active_steering_value = 0.0
         if tap_timer > 0: tap_timer -= 1
@@ -676,6 +690,8 @@ if __name__ == '__main__':
                 low_light = shared_data.get('low_light', False)
                 chaser_behind = shared_data.get('chaser_behind', False)
                 chaser_boxes = shared_data.get('chaser_boxes', [])
+                chaser_proximity = shared_data.get('chaser_proximity', 0.0)
+                chaser_evade_end = shared_data.get('chaser_evade_end_time', 0.0)
                 seek_red_end = shared_data.get('seek_red_end_time', 0.0)
                 
                 current_rel_lane = shared_data.get('net_lane_position', 0)
@@ -762,8 +778,11 @@ if __name__ == '__main__':
                 display_back = cv2.resize(back_frame, (320, 240))
                 display_back = cv2.flip(display_back, 1) 
                 
-                if chaser_behind:
-                    cv2.putText(display_back, "CHASER WARNING", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2) 
+                latched = time.time() < chaser_evade_end
+                if chaser_behind or latched:
+                    sweep = "RIGHT" if evade_dir > 0 else "LEFT"
+                    cv2.putText(display_back, f"CHASER | prox {chaser_proximity:.2f} | SWEEP {sweep}",
+                                (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
                     for (x, y, w, h) in chaser_boxes:
                         cv2.rectangle(display_back, (x, y), (x+w, y+h), (0, 255, 0), 2)
                         cv2.putText(display_back, "CHASER", (x, y-5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
