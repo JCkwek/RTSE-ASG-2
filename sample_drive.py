@@ -500,18 +500,19 @@ def processing_task():
         
         with state_lock:
             now2 = time.time()
-            # EV2: the police car stays on-screen ~10s and you have the FULL 10s to
-            # collect a red. Arm a one-shot 10s window on a fresh police sighting
-            # (debounced 1s through detection dropouts, like the chaser latch) rather
-            # than a short window re-extended each frame -- so the seek survives the
-            # police car leaving the front ROI before a red is grabbed, and does not
-            # re-arm after one is collected (which would over-collect score-negative reds).
+            # EV2: collect a red within 5s OF THE CAR SPAWNING. Arm a one-shot 5s
+            # window on a fresh police sighting (debounced 1s through detection
+            # dropouts, like the chaser latch). One-shot, not re-extended each
+            # frame, so it (a) matches the 5s pass deadline rather than seeking the
+            # whole ~10s the car is on-screen -- a red grabbed after 5s does NOT pass
+            # EV2 yet still costs net green -- and (b) survives the car leaving the
+            # front ROI, and does not re-arm after a red is collected.
             police_seen_end = shared_data.get('police_seen_end_time', 0.0)
             police_present_before = now2 < police_seen_end
             if police_detected:
                 shared_data['police_seen_end_time'] = now2 + 1.0
                 if not police_present_before:
-                    shared_data['seek_red_end_time'] = now2 + 10.0
+                    shared_data['seek_red_end_time'] = now2 + 5.0
 
             seek_red_end = shared_data.get('seek_red_end_time', 0.0)
             seek_red_mode = now2 < seek_red_end
