@@ -11,7 +11,7 @@ import os
 
 from chaser_logic import chaser_box_metrics
 from decision_logic import evaluate_decision
-from lane_geometry import occupied_lanes
+from lane_geometry import occupied_lanes, fit_road_model, model_from_bounds
 
 try:
     import pytesseract
@@ -272,11 +272,11 @@ def ocr_task():
 # ---------------------------------------------------------
 ROI_START_Y = 100
 
-def get_occupied_lanes(x, y, w, h, road_bounds=None):
-    # Classify against the MEASURED road (road_bounds) when available so decisions
-    # match the on-screen lane grid; falls back to a fixed model when no curbs are
-    # seen. Pure math lives in lane_geometry.occupied_lanes (unit-tested).
-    return occupied_lanes(x + w/2.0, y + h/2.0, w, road_bounds, ROI_START_Y)
+def get_occupied_lanes(x, y, w, h, road_model=None):
+    # Classify against the fitted road model (floating horizon) when available so
+    # decisions match the real road through slopes; falls back to a fixed model
+    # when no curbs are seen. Pure math lives in lane_geometry (unit-tested).
+    return occupied_lanes(x + w/2.0, y + h/2.0, w, road_model, ROI_START_Y)
 
 def detect_back_environment(back_frame):
     if back_frame is None: return [], 0.0, 0
@@ -353,23 +353,32 @@ def detect_environment(front_frame):
     h_roi, w_roi = roi_hsv.shape[:2]
     best_road_bounds = None
     max_measured_gap = 0
-    
-    for scan_y in [h_roi - 5, h_roi - 15, h_roi - 25]:
+    road_samples = []  # (y_fullframe, center_x, road_width) per measured curb row
+
+    # Scan many rows across the ROI (not just the bottom few) so the road model
+    # can FIT where the curbs converge -- a horizon that floats with the camera
+    # pitch on slopes, instead of a fixed horizon that drifts out of position.
+    for scan_y in range(h_roi - 5, 5, -5):
         row = mask_curb_clean[scan_y, :]
         curb_idx = np.where(row > 0)[0]
         curb_idx = np.concatenate(([0], curb_idx, [w_roi - 1]))
-        
+
         diffs = np.diff(curb_idx)
-        if len(diffs) > 0:
-            max_gap_idx = np.argmax(diffs)
-            max_gap = diffs[max_gap_idx]
-            if max_gap >= 80: 
-                x_left = curb_idx[max_gap_idx]
-                x_right = curb_idx[max_gap_idx + 1]
-                lane_w = max_gap / 5.0
-                if max_gap > max_measured_gap:
-                    max_measured_gap = max_gap
-                    best_road_bounds = (x_left, x_right, lane_w, scan_y)
+        if len(diffs) == 0:
+            continue
+        max_gap_idx = np.argmax(diffs)
+        max_gap = int(diffs[max_gap_idx])
+        if max_gap < 80:
+            continue
+        x_left = int(curb_idx[max_gap_idx])
+        x_right = int(curb_idx[max_gap_idx + 1])
+        road_samples.append((scan_y + ROI_START_Y, (x_left + x_right) / 2.0, float(max_gap)))
+        if max_gap > max_measured_gap:
+            max_measured_gap = max_gap
+            best_road_bounds = (x_left, x_right, max_gap / 5.0, scan_y)
+
+    # Prefer the multi-row fit (slope-aware); else the single widest row; else fixed.
+    road_model = fit_road_model(road_samples) or model_from_bounds(best_road_bounds, ROI_START_Y)
 
     mask_green = cv2.morphologyEx(mask_green, cv2.MORPH_OPEN, morph_kernel)
     mask_red = cv2.morphologyEx(mask_red, cv2.MORPH_OPEN, morph_kernel)
@@ -415,7 +424,7 @@ def detect_environment(front_frame):
                     car_y, car_h = max(0, light_y - int(light_h * 0.2)), int(light_h * 4.0)
                     police_car_zones.append((car_x, car_y, car_w, car_h))
                     
-                    lanes = get_occupied_lanes(car_x, car_y, car_w, car_h, best_road_bounds)
+                    lanes = get_occupied_lanes(car_x, car_y, car_w, car_h, road_model)
                     if lanes:
                         detected_objects.append({'type': 'DANGER', 'subtype': 'POLICE', 'lanes': lanes, 'dist': (car_y + car_h/2 + ROI_START_Y) - 80})
                         debug_tokens.append(('POLICE', car_x, car_y, car_w, car_h))
@@ -426,7 +435,7 @@ def detect_environment(front_frame):
         if any(px <= cx <= px+pw and py <= cy <= py+ph for (px, py, pw, ph) in police_car_zones): continue
         area = red_areas[(x, y, w, h)]
         if is_valid_3d_token(x, y, w, h, area):
-            lanes = get_occupied_lanes(x, y, w, h, best_road_bounds)
+            lanes = get_occupied_lanes(x, y, w, h, road_model)
             if lanes:
                 detected_objects.append({'type': 'DANGER', 'subtype': 'RED', 'lanes': lanes, 'dist': (y + h/2 + ROI_START_Y) - 80, 'area': area})
                 debug_tokens.append((f'RED:{int(area)}', x, y, w, h))
@@ -438,7 +447,7 @@ def detect_environment(front_frame):
         cx, cy = x + w/2, y + h/2
         if any(px <= cx <= px+pw and py <= cy <= py+ph for (px, py, pw, ph) in police_car_zones): continue
         if is_valid_3d_token(x, y, w, h, area):
-            lanes = get_occupied_lanes(x, y, w, h, best_road_bounds)
+            lanes = get_occupied_lanes(x, y, w, h, road_model)
             if lanes:
                 detected_objects.append({'type': 'GREEN', 'subtype': 'GREEN', 'lanes': lanes, 'dist': (y + h/2 + ROI_START_Y) - 80})
                 debug_tokens.append(('GREEN', x, y, w, h))
