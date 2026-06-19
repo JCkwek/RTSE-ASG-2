@@ -67,7 +67,10 @@ TAP_HOLD_FRAMES = 12
 COOLDOWN_FRAMES = 15
 
 # --- Chaser evasion tunables (EV3/EV4) ---
-MIN_CHASER_AREA = 12          # rear-mask noise floor (320x240 space)
+MIN_CHASER_AREA = 5           # rear-mask noise floor (320x240 space); low so a
+                              # far/small chaser is seen early -- largest-contour
+                              # selection already rejects stray noise. Raise if
+                              # false weaves appear with no chaser present.
 CHASER_EVADE_LATCH_SEC = 0.6  # keep evading through 1-frame detection dropouts
 CHASER_CLOSE_PROXIMITY = 0.6  # >= this => escalate (never coast)
 EMERGENCY_TAP_HOLD_FRAMES = 7 # shorter hold so lane changes chain into a weave
