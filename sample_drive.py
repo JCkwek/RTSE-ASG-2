@@ -6,6 +6,17 @@ import numpy as np
 import time
 import select
 import ctypes
+import re
+import os
+
+try:
+    import pytesseract
+    TESSERACT_AVAILABLE = True
+    if os.path.exists(r'C:\Program Files\Tesseract-OCR\tesseract.exe'):
+        pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+except ImportError:
+    TESSERACT_AVAILABLE = False
+    print("[WARNING] pytesseract module not found. Golden Lane disabled.")
 
 # ---------------------------------------------------------
 # Configuration
@@ -29,10 +40,16 @@ shared_data = {
     'debug_info': "WAITING",  
     'debug_tokens': [],        
     'net_lane_position': 0,
+    'lane_history': [0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 
+    'road_bounds': None,   
     'low_light': False,
     'chaser_behind': False,
     'chaser_boxes': [],
-    'seek_red_end_time': 0.0
+    'seek_red_end_time': 0.0,
+    'golden_lane_target': 0,
+    'golden_lane_end_time': 0.0,
+    'debug_ocr_text': "",
+    'debug_golden_mask': None
 }
 is_running = True
 baseline_brightness = None
@@ -41,8 +58,8 @@ tap_state = 'IDLE'
 tap_timer = 0
 active_steering_value = 0.0
 smoothed_steering = 0.0      
-TAP_HOLD_FRAMES = 10         
-COOLDOWN_FRAMES = 20         
+TAP_HOLD_FRAMES = 12         
+COOLDOWN_FRAMES = 15         
 
 # Morphology Kernel
 morph_kernel = np.ones((3, 3), np.uint8)
@@ -74,29 +91,22 @@ class RTTask(threading.Thread):
         print(f"[{self.name}] Started | Period: {self.period}s | Priority: {self.priority}")
         try:
             handle = ctypes.windll.kernel32.GetCurrentThread()
-            if self.priority == TaskPriority.HIGH:
-                ctypes.windll.kernel32.SetThreadPriority(handle, 2)
-            elif self.priority == TaskPriority.MEDIUM:
-                ctypes.windll.kernel32.SetThreadPriority(handle, 0)
-            elif self.priority == TaskPriority.LOW:
-                ctypes.windll.kernel32.SetThreadPriority(handle, -2)
-        except Exception as e:
-            pass
+            if self.priority == TaskPriority.HIGH: ctypes.windll.kernel32.SetThreadPriority(handle, 2)
+            elif self.priority == TaskPriority.MEDIUM: ctypes.windll.kernel32.SetThreadPriority(handle, 0)
+            elif self.priority == TaskPriority.LOW: ctypes.windll.kernel32.SetThreadPriority(handle, -2)
+        except Exception: pass
 
         while is_running:
             start_time = time.time()
             self.execute_func()
             exec_time = time.time() - start_time
             sleep_time = self.period - exec_time
-            
             if sleep_time > 0:
-                if sleep_time > 0.002:
-                    time.sleep(sleep_time - 0.002)
-                while (time.time() - start_time) < self.period:
-                    pass
+                if sleep_time > 0.002: time.sleep(sleep_time - 0.002)
+                while (time.time() - start_time) < self.period: pass
 
 # ---------------------------------------------------------
-# Network Connection Setup (Do not change this in your code)
+# Network Connection Setup
 # ---------------------------------------------------------
 front_camera_sock = None
 back_camera_sock = None
@@ -104,11 +114,9 @@ control_conn = None
 
 def setup_cameras():
     global front_camera_sock, back_camera_sock
-    
     print("Connecting to Cameras...")
     front_connected = False
     back_connected = False
-    
     while is_running and not (front_connected and back_connected):
         if not front_connected:
             try:
@@ -119,7 +127,6 @@ def setup_cameras():
                 print("Connected to Front Camera successfully.")
                 front_connected = True
             except Exception: pass
-                
         if not back_connected:
             try:
                 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -129,9 +136,7 @@ def setup_cameras():
                 print("Connected to Back Camera successfully.")
                 back_connected = True
             except Exception: pass
-                
-        if not (front_connected and back_connected):
-            time.sleep(1)
+        if not (front_connected and back_connected): time.sleep(1)
 
 def setup_control_server():
     global control_conn
@@ -141,15 +146,13 @@ def setup_control_server():
     server_sock.listen()
     server_sock.settimeout(1.0)
     print(f"Control server listening on {CONTROL_HOST}:{CONTROL_PORT}")
-    
     while is_running:
         try:
             conn, addr = server_sock.accept()
             print(f"Control client connected from {addr}")
             control_conn = conn
             break
-        except socket.timeout:
-            continue
+        except socket.timeout: continue
 
 # ---------------------------------------------------------
 # Task Implementations (This is where you write your tasks)
@@ -157,8 +160,7 @@ def setup_control_server():
 
 def read_single_camera(sock, data_key):
     #This function reads the latest frame from the camera socket and stores it in the shared data
-    if sock is None: 
-        return
+    if sock is None: return
     try:
         sock.settimeout(None)
         length_bytes = sock.recv(4)
@@ -169,13 +171,12 @@ def read_single_camera(sock, data_key):
             packet = sock.recv(image_length - len(received_bytes))
             if not packet: break
             received_bytes += packet
-            
         if len(received_bytes) == image_length:
             np_arr = np.frombuffer(received_bytes, np.uint8)
             frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
             if frame is not None:
                 with frame_lock: shared_data[data_key] = frame
-                
+
         # Clear backlog to ensure real-time performance
         while is_running:
             readable, _, _ = select.select([sock], [], [], 0.0)
@@ -196,11 +197,48 @@ def read_single_camera(sock, data_key):
                     with frame_lock: shared_data[data_key] = frame
     except Exception: pass
 
-def read_front_camera_task(): 
-    read_single_camera(front_camera_sock, 'latest_front_frame')
+def read_front_camera_task(): read_single_camera(front_camera_sock, 'latest_front_frame')
+def read_back_camera_task(): read_single_camera(back_camera_sock, 'latest_back_frame')
 
-def read_back_camera_task(): 
-    read_single_camera(back_camera_sock, 'latest_back_frame')
+# ------------------------------------
+# OCR Golden Lane Scanner Task
+# ------------------------------------
+def ocr_task():
+    if not TESSERACT_AVAILABLE: return
+    with frame_lock: frame = shared_data.get('latest_front_frame')
+    if frame is None: return
+
+    with state_lock:
+        if time.time() < shared_data.get('golden_lane_end_time', 0.0):
+            return
+
+    try:
+        h, w = frame.shape[:2]
+        crop_img = frame[0:int(h * 0.15), int(w * 0.1):int(w * 0.9)]
+        
+        hsv = cv2.cvtColor(crop_img, cv2.COLOR_BGR2HSV)
+        mask = cv2.inRange(hsv, np.array([15, 100, 100]), np.array([40, 255, 255]))
+        
+        with state_lock: shared_data['debug_golden_mask'] = mask.copy()
+        
+        if cv2.countNonZero(mask) > 15: 
+            mask_large = cv2.resize(mask, (0, 0), fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
+            mask_inv = cv2.bitwise_not(mask_large)
+            mask_padded = cv2.copyMakeBorder(mask_inv, 20, 20, 20, 20, cv2.BORDER_CONSTANT, value=255)
+            
+            text = pytesseract.image_to_string(mask_padded, config='--psm 7').upper()
+            
+            with state_lock: shared_data['debug_ocr_text'] = text.strip()
+            
+            match = re.search(r'LANE\s*([1-5])', text)
+            if match:
+                lane_num = int(match.group(1)) 
+                with state_lock:
+                    shared_data['golden_lane_target'] = lane_num
+                    shared_data['golden_lane_end_time'] = time.time() + 5.5 
+        else:
+            with state_lock: shared_data['debug_ocr_text'] = ""
+    except Exception: pass
 
 # ---------------------------------------------------------
 # Simplified Perception & Decision
@@ -212,25 +250,18 @@ def get_occupied_lanes(x, y, w, h):
     dist_to_horizon = actual_y - 80 
     if dist_to_horizon <= 0: return []
     
-    margin_width = dist_to_horizon * 0.857
-    margin_left = 160 - margin_width
-    margin_right = 160 + margin_width
-    
+    lane_width = dist_to_horizon * 0.44 
+    if lane_width <= 0: return []
+
     cx = x + w/2
-    if cx < margin_left or cx > margin_right: return []
+    rel_lane = round((cx - 160) / lane_width)
     
-    lane_half_width = dist_to_horizon * 0.22
-    left_bound = 160 - lane_half_width
-    right_bound = 160 + lane_half_width
-    
-    token_l = x
-    token_r = x + w
-    
-    lanes = []
-    if token_l <= left_bound and token_r >= margin_left: lanes.append(-1)
-    if token_l <= right_bound and token_r >= left_bound: lanes.append(0)
-    if token_l <= margin_right and token_r >= right_bound: lanes.append(1)
-    return lanes
+    lanes = [max(-2, min(2, int(rel_lane)))]
+    if w > lane_width * 1.5:
+        lanes.append(max(-2, min(2, int(rel_lane)-1)))
+        lanes.append(max(-2, min(2, int(rel_lane)+1)))
+
+    return list(set(lanes))
 
 def detect_back_environment(back_frame):
     if back_frame is None: return []
@@ -272,11 +303,8 @@ def detect_environment(front_frame):
     blurred_roi = cv2.GaussianBlur(roi_front, (5, 5), 0)
     roi_hsv = cv2.cvtColor(blurred_roi, cv2.COLOR_BGR2HSV)
     
-    # Low Brightness Detection Logic
     gray_frame = cv2.cvtColor(small_frame, cv2.COLOR_BGR2GRAY)
-    left_periph = gray_frame[120:180, 0:40]
-    right_periph = gray_frame[120:180, 280:320]
-    current_periph_brightness = (np.mean(left_periph) + np.mean(right_periph)) / 2.0
+    current_periph_brightness = (np.mean(gray_frame[120:180, 0:40]) + np.mean(gray_frame[120:180, 280:320])) / 2.0
     
     if baseline_brightness is None:
         if current_periph_brightness > 40: baseline_brightness = current_periph_brightness
@@ -291,27 +319,53 @@ def detect_environment(front_frame):
     mask_red1 = cv2.inRange(roi_hsv, np.array([0, 100, 80]), np.array([10, 255, 255]))
     mask_red2 = cv2.inRange(roi_hsv, np.array([170, 100, 80]), np.array([180, 255, 255]))
     mask_red = mask_red1 | mask_red2
-    mask_yellow = cv2.inRange(roi_hsv, np.array([15, 100, 100]), np.array([35, 255, 255]))
+    mask_yellow = cv2.inRange(roi_hsv, np.array([10, 100, 100]), np.array([40, 255, 255]))
     mask_blue = cv2.inRange(roi_hsv, np.array([90, 100, 100]), np.array([135, 255, 255]))
-    
     mask_white = cv2.inRange(roi_hsv, np.array([0, 0, 180]), np.array([180, 45, 255]))
     
+    mask_curb = cv2.bitwise_or(mask_red, mask_white)
+    mask_curb = cv2.morphologyEx(mask_curb, cv2.MORPH_CLOSE, np.ones((7,7), np.uint8), iterations=2)
+    
+    mask_curb_clean = np.zeros_like(mask_curb)
+    contours_curb, _ = cv2.findContours(mask_curb, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    for c in contours_curb:
+        if cv2.contourArea(c) > 150: 
+            cv2.drawContours(mask_curb_clean, [c], -1, 255, -1)
+            
+    h_roi, w_roi = roi_hsv.shape[:2]
+    best_road_bounds = None
+    max_measured_gap = 0
+    
+    for scan_y in [h_roi - 5, h_roi - 15, h_roi - 25]:
+        row = mask_curb_clean[scan_y, :]
+        curb_idx = np.where(row > 0)[0]
+        curb_idx = np.concatenate(([0], curb_idx, [w_roi - 1]))
+        
+        diffs = np.diff(curb_idx)
+        if len(diffs) > 0:
+            max_gap_idx = np.argmax(diffs)
+            max_gap = diffs[max_gap_idx]
+            if max_gap >= 80: 
+                x_left = curb_idx[max_gap_idx]
+                x_right = curb_idx[max_gap_idx + 1]
+                lane_w = max_gap / 5.0
+                if max_gap > max_measured_gap:
+                    max_measured_gap = max_gap
+                    best_road_bounds = (x_left, x_right, lane_w, scan_y)
+
     mask_green = cv2.morphologyEx(mask_green, cv2.MORPH_OPEN, morph_kernel)
     mask_red = cv2.morphologyEx(mask_red, cv2.MORPH_OPEN, morph_kernel)
     mask_yellow = cv2.morphologyEx(mask_yellow, cv2.MORPH_OPEN, morph_kernel)
     mask_blue = cv2.morphologyEx(mask_blue, cv2.MORPH_OPEN, morph_kernel)
-    mask_white = cv2.morphologyEx(mask_white, cv2.MORPH_OPEN, morph_kernel)
 
     contours_g, _ = cv2.findContours(mask_green, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     contours_red, _ = cv2.findContours(mask_red, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     contours_yellow, _ = cv2.findContours(mask_yellow, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     contours_blue, _ = cv2.findContours(mask_blue, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    detected_objects = []
-    debug_tokens = []
+    detected_objects, debug_tokens = [], []
+    raw_red_boxes, red_areas = [], {} 
     
-    raw_red_boxes = []
-    red_areas = {} 
     for c in contours_red:
         area = cv2.contourArea(c)
         if area > 5: 
@@ -331,92 +385,52 @@ def detect_environment(front_frame):
             is_police = False
             rx, ry, rw, rh = 0, 0, 0, 0
             
-            for r_box in raw_red_boxes:
-                tx, ty, tw, th = r_box
-                r_cx, r_cy = tx + tw/2.0, ty + th/2.0
-                
-                vert_aligned = abs(b_cy - r_cy) < 10
-                width_ratio = bw / max(1.0, float(tw))
-                height_ratio = bh / max(1.0, float(th))
-                similar_size = (0.3 < width_ratio < 3.0) and (0.3 < height_ratio < 3.0)
-                max_gap = max(bw, tw) * 1.5
-                horiz_adjacent = abs(b_cx - r_cx) < (bw/2.0 + tw/2.0 + max_gap)
-                
-                if vert_aligned and similar_size and horiz_adjacent:
-                    is_police = True
-                    rx, ry, rw, rh = tx, ty, tw, th
+            for tx, ty, tw, th in raw_red_boxes:
+                if abs(b_cy - (ty + th/2.0)) < 15 and (0.3 < (bw / max(1.0, float(tw))) < 3.0) and abs(b_cx - (tx + tw/2.0)) < (bw/2.0 + tw/2.0 + max(bw, tw)*1.5):
+                    is_police, rx, ry, rw, rh = True, tx, ty, tw, th
                     break 
             
             if is_police:
                 light_x, light_y = min(bx, rx), min(by, ry)
-                light_w = max(bx+bw, rx+rw) - light_x
-                light_h = max(by+bh, ry+rh) - light_y
-                light_aspect = light_w / max(1.0, float(light_h))
-                
-                if light_w < 120 and light_aspect > 1.2:
+                light_w, light_h = max(bx+bw, rx+rw) - light_x, max(by+bh, ry+rh) - light_y
+                if light_w < 120 and (light_w / max(1.0, float(light_h))) > 1.2:
                     pad_x = int(light_w * 0.5)
-                    car_x = max(0, light_x - pad_x)
-                    car_w = int(light_w * 2.0)
-                    car_y = max(0, light_y - int(light_h * 0.2))
-                    car_h = int(light_h * 4.0)
+                    car_x, car_w = max(0, light_x - pad_x), int(light_w * 2.0)
+                    car_y, car_h = max(0, light_y - int(light_h * 0.2)), int(light_h * 4.0)
                     police_car_zones.append((car_x, car_y, car_w, car_h))
+                    
                     lanes = get_occupied_lanes(car_x, car_y, car_w, car_h)
                     if lanes:
-                        dist = (car_y + car_h/2 + ROI_START_Y) - 80
-                        detected_objects.append({'type': 'DANGER', 'subtype': 'POLICE', 'lanes': lanes, 'dist': dist})
-                        debug_tokens.append(('POLICE', car_x*2, (car_y+ROI_START_Y)*2, car_w*2, car_h*2))
+                        detected_objects.append({'type': 'DANGER', 'subtype': 'POLICE', 'lanes': lanes, 'dist': (car_y + car_h/2 + ROI_START_Y) - 80})
+                        debug_tokens.append(('POLICE', car_x, car_y, car_w, car_h))
 
     for r_box in raw_red_boxes:
         x, y, w, h = r_box
         cx, cy = x + w/2, y + h/2
-        
         if any(px <= cx <= px+pw and py <= cy <= py+ph for (px, py, pw, ph) in police_car_zones): continue
-        
-        pad = 12
-        nx1, ny1 = max(0, x - pad), max(0, y - pad)
-        nx2, ny2 = min(roi_hsv.shape[1], x + w + pad), min(roi_hsv.shape[0], y + h + pad)
-
-        white_nearby = cv2.countNonZero(mask_white[ny1:ny2, nx1:nx2])
-        green_nearby = cv2.countNonZero(mask_green[ny1:ny2, nx1:nx2])
-
-        if white_nearby > 30 or green_nearby > 40:
-            continue
-
         area = red_areas[(x, y, w, h)]
         if is_valid_3d_token(x, y, w, h, area):
             lanes = get_occupied_lanes(x, y, w, h)
             if lanes:
-                dist = (y + h/2 + ROI_START_Y) - 80
-                detected_objects.append({'type': 'DANGER', 'subtype': 'RED', 'lanes': lanes, 'dist': dist})
-                debug_tokens.append(('DANGER_RED', x*2, (y+ROI_START_Y)*2, w*2, h*2))
+                detected_objects.append({'type': 'DANGER', 'subtype': 'RED', 'lanes': lanes, 'dist': (y + h/2 + ROI_START_Y) - 80})
+                debug_tokens.append(('DANGER_RED', x, y, w, h))
 
-    for c in contours_yellow:
-        area = cv2.contourArea(c)
-        x, y, w, h = cv2.boundingRect(c)
-        cx, cy = x + w/2, y + h/2
-        if any(px <= cx <= px+pw and py <= cy <= py+ph for (px, py, pw, ph) in police_car_zones): continue
-        if is_valid_3d_token(x, y, w, h, area):
-            lanes = get_occupied_lanes(x, y, w, h)
-            if lanes:
-                dist = (y + h/2 + ROI_START_Y) - 80
-                detected_objects.append({'type': 'DANGER', 'subtype': 'YELLOW', 'lanes': lanes, 'dist': dist})
-                debug_tokens.append(('DANGER_YELLOW', x*2, (y+ROI_START_Y)*2, w*2, h*2))
-    
-    for c in contours_g:
-        area = cv2.contourArea(c)
-        x, y, w, h = cv2.boundingRect(c)
-        cx, cy = x + w/2, y + h/2
-        if any(px <= cx <= px+pw and py <= cy <= py+ph for (px, py, pw, ph) in police_car_zones): continue
-        if is_valid_3d_token(x, y, w, h, area):
-            lanes = get_occupied_lanes(x, y, w, h)
-            if lanes:
-                dist = (y + h/2 + ROI_START_Y) - 80
-                detected_objects.append({'type': 'GREEN', 'subtype': 'GREEN', 'lanes': lanes, 'dist': dist})
-                debug_tokens.append(('GREEN', x*2, (y+ROI_START_Y)*2, w*2, h*2))
-                    
-    return detected_objects, debug_tokens, low_light_mode
+    for contour_list, t_type, sub_type in [(contours_yellow, 'DANGER', 'YELLOW'), (contours_g, 'GREEN', 'GREEN')]:
+        for c in contour_list:
+            area, x, y, w, h = cv2.contourArea(c), *cv2.boundingRect(c)
+            cx, cy = x + w/2, y + h/2
+            if any(px <= cx <= px+pw and py <= cy <= py+ph for (px, py, pw, ph) in police_car_zones): continue
+            if is_valid_3d_token(x, y, w, h, area):
+                lanes = get_occupied_lanes(x, y, w, h)
+                if lanes:
+                    detected_objects.append({'type': t_type, 'subtype': sub_type, 'lanes': lanes, 'dist': (y + h/2 + ROI_START_Y) - 80})
+                    debug_tokens.append((sub_type, x, y, w, h))
+    return detected_objects, debug_tokens, low_light_mode, best_road_bounds
 
-def evaluate_decision(detected_objects, current_lane, low_light_mode, chaser_behind, chaser_boxes, seek_red_mode):
+# ---------------------------------------------------------
+# Decision Making
+# ---------------------------------------------------------
+def evaluate_decision(detected_objects, current_lane, low_light_mode, chaser_behind, chaser_boxes, seek_red_mode, golden_mode, golden_target):
     target_steer = 0.0
     target_accel = 1.0
     debug_text = "CRUISING"
@@ -425,107 +439,83 @@ def evaluate_decision(detected_objects, current_lane, low_light_mode, chaser_beh
     if low_light_mode and not chaser_behind:
         return 0.0, -1.0, "LOW LIGHT: BRAKING TO RECOVER"
 
-    police_lanes = set()
-    danger_lanes = set()
-    red_lanes = set()
-    green_lanes = set()
+    police_lanes, danger_lanes, red_lanes, green_lanes = set(), set(), set(), set()
 
     for obj in detected_objects:
         for lane in obj['lanes']:
+            if current_lane + lane < -2 or current_lane + lane > 2: continue
             if obj['type'] == 'DANGER':
-                if obj.get('subtype') == 'POLICE':
-                    police_lanes.add(lane)
+                if obj.get('subtype') == 'POLICE': police_lanes.add(lane)
                 elif obj.get('subtype') == 'RED':
                     red_lanes.add(lane)
-                    if not seek_red_mode: 
-                        danger_lanes.add(lane) 
-                else:
-                    danger_lanes.add(lane)
-            elif obj['type'] == 'GREEN':
-                green_lanes.add(lane)
+                    if not seek_red_mode: danger_lanes.add(lane) 
+                else: danger_lanes.add(lane)
+            elif obj['type'] == 'GREEN': green_lanes.add(lane)
 
-    if police_lanes:
-        target_accel = 0.75
+    if police_lanes: target_accel = 0.75
 
     chaser_lanes = set()
     if chaser_behind:
         for (cx, cy, cw, ch) in chaser_boxes:
             center_x = cx + cw / 2.0
-            if center_x < 130:
-                chaser_lanes.add(-1)
-            elif center_x > 190:
-                chaser_lanes.add(1)
-            else:
-                chaser_lanes.add(0)
+            if center_x < 130: chaser_lanes.add(-1)
+            elif center_x > 190: chaser_lanes.add(1)
+            else: chaser_lanes.add(0)
+
+    # Golden lane event reaction
+    if golden_mode and 1 <= golden_target <= 5:
+        rel_golden = golden_target - (current_lane + 3)
+        
+        if rel_golden not in police_lanes:
+            if rel_golden < 0: return -1.0, target_accel, f"EV5: SEEKING L{golden_target} <<"
+            elif rel_golden > 0: return 1.0, target_accel, f"EV5: SEEKING L{golden_target} >>"
+            else: return 0.0, target_accel, f"HOLDING AT LANE {golden_target}"
 
     if 0 in police_lanes:
-        if -1 not in police_lanes and -1 not in danger_lanes:
-            return -1.0, target_accel, "<< EVADE POLICE LEFT"
-        elif 1 not in police_lanes and 1 not in danger_lanes:
-            return 1.0, target_accel, "EVADE POLICE RIGHT >>"
-        elif -1 not in police_lanes:
-            return -1.0, target_accel, "<< EVADE POLICE LEFT (RISK)"
-        else:
-            return 1.0, target_accel, "EVADE POLICE RIGHT (RISK) >>"
+        if -1 not in police_lanes and -1 not in danger_lanes and current_lane > -2: return -1.0, target_accel, "<< EVADE POLICE LEFT"
+        elif 1 not in police_lanes and 1 not in danger_lanes and current_lane < 2: return 1.0, target_accel, "EVADE POLICE RIGHT >>"
+        elif -1 not in police_lanes and current_lane > -2: return -1.0, target_accel, "<< EVADE POLICE LEFT (RISK)"
+        elif current_lane < 2: return 1.0, target_accel, "EVADE POLICE RIGHT (RISK) >>"
+        else: return 0.0, 0.5, "TRAPPED BY POLICE"
 
-    if chaser_behind and current_lane in chaser_lanes:
+    if chaser_behind and 0 in chaser_lanes:
         target_accel = 1.0 
-        safe_lanes = [l for l in [-1, 0, 1] if l not in police_lanes and l not in danger_lanes and l not in chaser_lanes]
-        if safe_lanes:
-            best_lane = min(safe_lanes, key=lambda l: abs(l - current_lane))
+        safe_lanes = [l for l in [-1, 0, 1] if l not in police_lanes and l not in danger_lanes and l not in chaser_lanes and -2 <= current_lane + l <= 2]
+        if safe_lanes: best_lane = min(safe_lanes, key=lambda l: abs(l))
         else:
-            semi_safe = [l for l in [-1, 0, 1] if l not in police_lanes and l not in chaser_lanes]
-            if semi_safe:
-                best_lane = min(semi_safe, key=lambda l: abs(l - current_lane))
-            else:
-                best_lane = current_lane 
+            semi_safe = [l for l in [-1, 0, 1] if l not in police_lanes and l not in chaser_lanes and -2 <= current_lane + l <= 2]
+            if semi_safe: best_lane = min(semi_safe, key=lambda l: abs(l))
+            else: best_lane = 0 
         
-        if best_lane < current_lane:
-            return -1.0, target_accel, "<< DODGE CHASER LEFT"
-        elif best_lane > current_lane:
-            return 1.0, target_accel, "DODGE CHASER RIGHT >>"
-        else:
-            return 0.0, target_accel, "CHASER IMMINENT! FLOOR IT!"
+        if best_lane < 0: return -1.0, target_accel, "<< DODGE CHASER LEFT"
+        elif best_lane > 0: return 1.0, target_accel, "DODGE CHASER RIGHT >>"
+        else: return 0.0, target_accel, "CHASER IMMINENT! FLOOR IT!"
 
     if seek_red_mode and red_lanes:
-        if 0 in red_lanes and 0 not in police_lanes:
-            return 0.0, target_accel, "SEEKING RED AHEAD"
-        elif -1 in red_lanes and -1 not in police_lanes:
-            return -1.0, target_accel, "<< SEEKING RED LEFT"
-        elif 1 in red_lanes and 1 not in police_lanes:
-            return 1.0, target_accel, "SEEKING RED RIGHT >>"
+        if 0 in red_lanes and 0 not in police_lanes: return 0.0, target_accel, "SEEKING RED AHEAD"
+        elif -1 in red_lanes and -1 not in police_lanes and current_lane > -2: return -1.0, target_accel, "<< SEEKING RED LEFT"
+        elif 1 in red_lanes and 1 not in police_lanes and current_lane < 2: return 1.0, target_accel, "SEEKING RED RIGHT >>"
 
     if 0 in danger_lanes:
-        safe_left = -1 not in danger_lanes and -1 not in police_lanes
-        safe_right = 1 not in danger_lanes and 1 not in police_lanes
+        safe_left = (-1 not in danger_lanes) and (-1 not in police_lanes) and (current_lane > -2)
+        safe_right = (1 not in danger_lanes) and (1 not in police_lanes) and (current_lane < 2)
 
         if safe_left and safe_right:
             # Both sides are safe. Actively look for a reason to pick one over the other.
-            if 1 in green_lanes: 
-                return 1.0, target_accel, "EVADE RIGHT (TO GREEN) >>"
-            elif -1 in green_lanes: 
-                return -1.0, target_accel, "<< EVADE LEFT (TO GREEN)"
-            else:
-                return -1.0, target_accel, "<< EVADE LEFT (DEFAULT)" # Fallback
-        elif safe_left:
-            return -1.0, target_accel, "<< EVADE LEFT"
-        elif safe_right:
-            return 1.0, target_accel, "EVADE RIGHT >>"
-        else:
-            return 1.0, target_accel, "TRAPPED! PUSH RIGHT >>"
+            if 1 in green_lanes: return 1.0, target_accel, "EVADE RIGHT (TO GREEN) >>"
+            elif -1 in green_lanes: return -1.0, target_accel, "<< EVADE LEFT (TO GREEN)"
+            else: return -1.0, target_accel, "<< EVADE LEFT (DEFAULT)" 
+        elif safe_left: return -1.0, target_accel, "<< EVADE LEFT"
+        elif safe_right: return 1.0, target_accel, "EVADE RIGHT >>"
+        else: return 0.0, 0.6, "TRAPPED BY DANGER"
 
     if green_lanes:
-        if 0 in green_lanes:
-            return 0.0, target_accel, "SEEK GREEN AHEAD"
-        elif -1 in green_lanes and -1 not in danger_lanes and -1 not in police_lanes:
-            return -1.0, target_accel, "<< SEEK GREEN LEFT"
-        elif 1 in green_lanes and 1 not in danger_lanes and 1 not in police_lanes:
-            return 1.0, target_accel, "SEEK GREEN RIGHT >>"
+        if 0 in green_lanes: return 0.0, target_accel, "SEEK GREEN AHEAD"
+        elif -1 in green_lanes and -1 not in danger_lanes and -1 not in police_lanes and current_lane > -2: return -1.0, target_accel, "<< SEEK GREEN LEFT"
+        elif 1 in green_lanes and 1 not in danger_lanes and 1 not in police_lanes and current_lane < 2: return 1.0, target_accel, "SEEK GREEN RIGHT >>"
 
-    if current_lane < 0 and 1 not in police_lanes and 1 not in danger_lanes:
-        return 1.0, target_accel, "AUTO CENTER >>"
-    elif current_lane > 0 and -1 not in police_lanes and -1 not in danger_lanes:
-        return -1.0, target_accel, "<< AUTO CENTER"
+    if current_lane < 0 and 1 not in police_lanes and 1 not in danger_lanes: return 1.0, target_accel, "AUTO CENTER >>"
+    elif current_lane > 0 and -1 not in police_lanes and -1 not in danger_lanes: return -1.0, target_accel, "<< AUTO CENTER"
         
     return target_steer, target_accel, debug_text
 
@@ -534,6 +524,7 @@ def processing_task():
     #You can use libraries like OpenCV to process the image
     #There is no limtation to the complexity of the processing task, you can use any libraries you want
     #Remember to use the shared_data to get the latest frame
+    global tap_state
     with frame_lock: 
         front_frame = shared_data['latest_front_frame']
         back_frame = shared_data.get('latest_back_frame')
@@ -548,8 +539,11 @@ def processing_task():
             
         chaser_boxes = detect_back_environment(back_frame)
         chaser_behind = len(chaser_boxes) > 0
-        detected_objects, debug_tokens, low_light_mode = detect_environment(front_frame)
+        detected_objects, debug_tokens, low_light_mode, road_bounds = detect_environment(front_frame)
         
+        with state_lock:
+            shared_data['road_bounds'] = road_bounds
+
         police_detected = any('POLICE' in t[0] for t in debug_tokens)
         
         with state_lock:
@@ -559,22 +553,27 @@ def processing_task():
                 seek_red_end = shared_data['seek_red_end_time']
                 
             seek_red_mode = time.time() < seek_red_end
-            
             if seek_red_mode:
                 for obj in detected_objects:
-                    if obj.get('subtype') == 'RED' and current_lane in obj['lanes']:
+                    if obj.get('subtype') == 'RED' and 0 in obj['lanes']:
                         if obj['dist'] > -5: 
                             shared_data['seek_red_end_time'] = 0.0
                             seek_red_mode = False
                             break
+            
+            golden_lane_end = shared_data.get('golden_lane_end_time', 0.0)
+            golden_lane_target = shared_data.get('golden_lane_target', 0)
+            golden_mode = time.time() < golden_lane_end
                             
-        target_steer, target_accel, debug_text = evaluate_decision(detected_objects, current_lane, low_light_mode, chaser_behind, chaser_boxes, seek_red_mode)
+        target_steer, target_accel, debug_text = evaluate_decision(
+            detected_objects, current_lane, low_light_mode, chaser_behind, chaser_boxes, seek_red_mode, golden_mode, golden_lane_target
+        )
 
         with state_lock:
             shared_data['steering_input'] = target_steer
             shared_data['acceleration_input'] = target_accel
             shared_data['debug_tokens'] = debug_tokens
-            shared_data['debug_info'] = f"AUTO: {debug_text}"
+            shared_data['debug_info'] = debug_text
             shared_data['low_light'] = low_light_mode
             shared_data['chaser_behind'] = chaser_behind
             shared_data['chaser_boxes'] = chaser_boxes
@@ -584,7 +583,7 @@ def send_controls_task():
     global control_conn, tap_state, tap_timer, active_steering_value, smoothed_steering
     if control_conn is None: 
         return
-    
+
     #these are the variables used to control the car
     #steering_input: -1.0 to 1.0 (left to right)
     #acceleration_input: -1.0 to 1.0 (reverse to forward)
@@ -599,10 +598,10 @@ def send_controls_task():
             active_steering_value = auto_steer
             tap_state = 'TAPPING'
             tap_timer = TAP_HOLD_FRAMES
-            
+
             with state_lock:
-                if auto_steer < -0.1: shared_data['net_lane_position'] = max(-1, shared_data.get('net_lane_position', 0) - 1)
-                elif auto_steer > 0.1: shared_data['net_lane_position'] = min(1, shared_data.get('net_lane_position', 0) + 1)
+                if auto_steer < -0.1: shared_data['net_lane_position'] = max(-2, shared_data.get('net_lane_position', 0) - 1)
+                elif auto_steer > 0.1: shared_data['net_lane_position'] = min(2, shared_data.get('net_lane_position', 0) + 1)
         else: active_steering_value = 0.0
     elif tap_state == 'TAPPING':
         if tap_timer > 0: tap_timer -= 1
@@ -618,13 +617,8 @@ def send_controls_task():
     ALPHA = 1.0 if is_emergency else 0.4
     smoothed_steering = (ALPHA * active_steering_value) + ((1.0 - ALPHA) * smoothed_steering)
 
-    try:
-        data = struct.pack('ff', smoothed_steering, accel_input)
-        control_conn.sendall(data)
-    except Exception as e:
-        print(f"Control send error: {e}")
-        control_conn = None
-
+    try: control_conn.sendall(struct.pack('ff', smoothed_steering, accel_input))
+    except Exception: control_conn = None
 
 # ---------------------------------------------------------
 # Main (Scheduler Initialization)
@@ -655,6 +649,10 @@ if __name__ == '__main__':
     t_processing.start()
     t_controls.start()
     
+    if TESSERACT_AVAILABLE:
+        t_ocr = RTTask("OCR_Scanner", period=0.3, priority=TaskPriority.LOW, execute_func=ocr_task)
+        t_ocr.start() 
+    
     display_paused = False
     last_display_frame = None
 
@@ -679,9 +677,17 @@ if __name__ == '__main__':
                 chaser_behind = shared_data.get('chaser_behind', False)
                 chaser_boxes = shared_data.get('chaser_boxes', [])
                 seek_red_end = shared_data.get('seek_red_end_time', 0.0)
+                
+                current_rel_lane = shared_data.get('net_lane_position', 0)
+                road_bounds = shared_data.get('road_bounds', None)
+                
+                golden_lane_target = shared_data.get('golden_lane_target', 0)
+                golden_lane_end = shared_data.get('golden_lane_end_time', 0.0)
+                ocr_text = shared_data.get('debug_ocr_text', "")
+                golden_mask = shared_data.get('debug_golden_mask')
 
             key = cv2.waitKey(1) & 0xFF
-            if key == ord('p') or key == ord(' '): display_paused = not display_paused
+            if key in [ord('p'), ord(' ')]: display_paused = not display_paused
             elif key == ord('q'): is_running = False
 
             if front_frame is not None and not display_paused:
@@ -691,46 +697,76 @@ if __name__ == '__main__':
                 top_status_text = f"ACCEL: {accel_input:.2f} | {debug_info}"
                 cv2.putText(display_front, top_status_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
                 
+                current_abs_lane = current_rel_lane + 3
+                cv2.putText(display_front, f"CURRENT LANE: {current_abs_lane}", (400, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+
+                if road_bounds is not None:
+                    x_left, x_right, lane_w, scan_y = road_bounds
+                    
+                    draw_y = (scan_y + ROI_START_Y) * 2
+                    draw_xl, draw_xr = int(x_left * 2), int(x_right * 2)
+                    draw_lw = int(lane_w * 2)
+                    
+                    cv2.circle(display_front, (draw_xl, draw_y), 5, (0, 0, 255), -1)
+                    cv2.circle(display_front, (draw_xr, draw_y), 5, (0, 0, 255), -1)
+                    cv2.line(display_front, (draw_xl, draw_y), (draw_xr, draw_y), (0, 255, 255), 3)
+                    cv2.putText(display_front, "TRACK BOUNDARY (R/W)", (max(10, draw_xl), draw_y - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                    
+                    for i in range(5):
+                        seg_x = int(draw_xl + (i + 0.5) * draw_lw)
+                        cv2.putText(display_front, f"L{i+1}", (seg_x - 15, draw_y + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                        if i > 0:
+                            div_x = int(draw_xl + i * draw_lw)
+                            cv2.line(display_front, (div_x, draw_y - 10), (div_x, draw_y + 10), (255, 0, 255), 2)
+                            
+                    cv2.line(display_front, (320, draw_y - 40), (320, draw_y + 40), (0, 255, 0), 3)
+                    cv2.putText(display_front, "CAR", (300, draw_y - 45), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
                 time_left = seek_red_end - time.time()
-                if time_left > 0:
+                if time_left > 0: 
                     cv2.putText(display_front, f"SEEK RED MODE: {time_left:.1f}s", (120, 150), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 3)
                 
-                if low_light:
+                golden_time_left = golden_lane_end - time.time()
+                if golden_time_left > 0 and golden_lane_target > 0:
+                    cv2.putText(display_front, f"GOLDEN DETECTED: L{golden_lane_target} ({golden_time_left:.1f}s)", (100, 180), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 215, 255), 3)
+                
+                if low_light: 
                     cv2.putText(display_front, "LOW LIGHT DETECTED", (150, 100), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 3)
 
-                cv2.line(display_front, (0, 200), (640, 200), (255, 0, 0), 2)
-                cv2.line(display_front, (0, 440), (640, 440), (255, 0, 0), 2)
-                cv2.putText(display_front, "ROI BOUNDARY", (10, 195), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1)
-
-                cv2.line(display_front, (320 - int(20*0.22*2), 200), (320 - int(160*0.22*2), 480), (255, 255, 255), 2)
-                cv2.line(display_front, (320 + int(20*0.22*2), 200), (320 + int(160*0.22*2), 480), (255, 255, 255), 2)
-                
                 for token_data in debug_tokens:
                     if len(token_data) >= 5:
                         ttype, x, y, w, h = token_data[:5]
-                        
-                        if 'POLICE' in ttype: color = (255, 0, 0)
-                        elif 'DANGER' in ttype: color = (0, 0, 255)
-                        else: color = (0, 255, 0)
-                        
-                        cv2.rectangle(display_front, (x, y), (x+w, y+h), color, 2)
-                        cv2.putText(display_front, ttype, (x, y-5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+                        color = (255, 0, 0) if 'POLICE' in ttype else ((0, 0, 255) if 'DANGER' in ttype else (0, 255, 0))
+                        disp_x, disp_y = x * 2, (y + ROI_START_Y) * 2
+                        disp_w, disp_h = w * 2, h * 2
+                        cv2.rectangle(display_front, (disp_x, disp_y), (disp_x + disp_w, disp_y + disp_h), color, 2)
+                        cv2.putText(display_front, ttype, (disp_x, disp_y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
 
                 action_text = "STRAIGHT"
                 if steer_input < -0.1: action_text = "<< STEER LEFT <<"
                 elif steer_input > 0.1: action_text = ">> STEER RIGHT >>"
+                else:
+                    if golden_time_left > 0 and golden_lane_target > 0:
+                        action_text = f"HOLDING AT LANE {golden_lane_target}"
+                
                 cv2.putText(display_front, f"ACTION: {action_text}", (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2)
+
+                if golden_mask is not None:
+                    gm_bgr = cv2.cvtColor(cv2.resize(golden_mask, (320, 60)), cv2.COLOR_GRAY2BGR)
+                    display_front[420:480, 0:320] = gm_bgr
+                    cv2.putText(display_front, f"OCR EXTR: {ocr_text}", (5, 415), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
 
                 last_display_frame = display_front
                 
             if back_frame is not None and not display_paused:
                 display_back = cv2.resize(back_frame, (320, 240))
+                display_back = cv2.flip(display_back, 1) 
                 
                 if chaser_behind:
-                    cv2.putText(display_back, "CHASER WARNING", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                    cv2.putText(display_back, "CHASER WARNING", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2) 
                     for (x, y, w, h) in chaser_boxes:
-                        cv2.rectangle(display_back, (x, y), (x+w, y+h), (0, 0, 255), 2)
-                        cv2.putText(display_back, "CHASER", (x, y-5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1)
+                        cv2.rectangle(display_back, (x, y), (x+w, y+h), (0, 255, 0), 2)
+                        cv2.putText(display_back, "CHASER", (x, y-5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
                     
                 cv2.imshow("Back Camera", display_back)
 
@@ -750,16 +786,13 @@ if __name__ == '__main__':
     t_back_camera.join()
     t_processing.join()
     t_controls.join()
+    if TESSERACT_AVAILABLE: t_ocr.join()
     
     # This is to close all the connections
-    if front_camera_sock:
-        front_camera_sock.close()
-    if back_camera_sock:
-        back_camera_sock.close()
-    if control_conn:
-        control_conn.close()
+    if front_camera_sock: front_camera_sock.close()
+    if back_camera_sock: back_camera_sock.close()
+    if control_conn: control_conn.close()
         
     try: ctypes.windll.winmm.timeEndPeriod(1)
     except Exception: pass
     cv2.destroyAllWindows()
-    print("System terminated cleanly.")
