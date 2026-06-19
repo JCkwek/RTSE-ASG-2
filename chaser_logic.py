@@ -1,4 +1,4 @@
-"""Pure, dependency-free decision helpers for chaser evasion.
+"""Pure, dependency-free lateral-decision helpers (chaser evasion + green harvest).
 
 Kept import-free so it can be unit-tested without OpenCV/NumPy or the
 Windows game runtime.
@@ -67,3 +67,39 @@ def chaser_box_metrics(x, y, w, h):
     else:
         side = 0
     return (final_x, final_y, box_w, box_h), proximity, side
+
+
+def choose_green_seek(current_lane, green_lanes, blocked):
+    """Pick a lateral move to harvest green across the 5-lane track.
+
+    current_lane: int in [LANE_MIN, LANE_MAX].
+    green_lanes:  set of RELATIVE offsets where green tokens were seen.
+    blocked:      RELATIVE offsets unsafe to enter (danger | police).
+
+    Returns (steer, label):
+      steer: 0.0 hold / -1.0 left / 1.0 right, or None if no good green move.
+      label: debug string ("" when steer is None).
+
+    Holds when green is straight ahead; otherwise moves one lane toward the
+    NEAREST reachable green side (current code only considered +-1).
+    """
+    if not green_lanes:
+        return None, ""
+    if 0 in green_lanes and 0 not in blocked:
+        return 0.0, "SEEK GREEN AHEAD"
+
+    left = [abs(l) for l in green_lanes if l < 0]
+    right = [l for l in green_lanes if l > 0]
+    can_left = (-1 not in blocked) and (current_lane > LANE_MIN)
+    can_right = (1 not in blocked) and (current_lane < LANE_MAX)
+
+    options = []  # (distance_to_nearest_green, steer, label)
+    if left and can_left:
+        options.append((min(left), -1.0, "<< SEEK GREEN LEFT"))
+    if right and can_right:
+        options.append((min(right), 1.0, "SEEK GREEN RIGHT >>"))
+    if not options:
+        return None, ""
+    options.sort(key=lambda o: o[0])
+    _, steer, label = options[0]
+    return steer, label

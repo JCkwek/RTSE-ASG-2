@@ -73,11 +73,17 @@ every time:
 
 ## 5. Golden timing rule (new, enables Golden+Chaser coexistence)
 
-Golden should expose its remaining time so it can yield:
+Golden exposes its remaining time so it can yield:
 - `golden_time_left = golden_lane_end_time − now`
-- If `golden_time_left > GOLDEN_COMMIT_SEC` (≈1.0s) and a higher-or-equal P1 (chaser) is active →
+- If `golden_time_left > GOLDEN_COMMIT_SEC` and a higher-or-equal P1 (chaser) is active →
   **let the chaser sweep run**.
 - If `golden_time_left ≤ GOLDEN_COMMIT_SEC` → **commit to the golden lane** regardless (final approach).
+
+`GOLDEN_COMMIT_SEC = 2.5` (implemented). It is **not** ~1.0s because the OCR latch
+(`now + 5.5s`) overshoots the real 5s EV5 timer by ~the OCR read lag (~1s). A 2.5s commit
+window makes the car hold the golden lane across the *real* expiry instant despite that lag.
+Tune against EV5 hit rate: raise it if EV5 is still missed (commit earlier), lower it if the
+chaser catches the car during golden overlaps.
 
 This converts golden from "always hold" to "hold at the moment that scores," freeing the earlier
 seconds for evasion and green harvest.
@@ -123,7 +129,7 @@ costs harvest time during chaser events — that's inherent, not a bug.
 
 ## 9. Open decisions for the team
 
-1. `GOLDEN_COMMIT_SEC` value (≈1.0s?) — depends on how fast a lane change completes.
+1. `GOLDEN_COMMIT_SEC` (implemented 2.5s) — validate against measured OCR read lag and EV5 hit rate.
 2. Is braking-while-steering effective in-game during Darkness+Chaser, or does the game ignore
    steer at `accel = −1.0`? (Needs a Windows test.)
 3. Confirm Chaser B's exact window vs Police (both ~30–50s) to validate the proximity guard.

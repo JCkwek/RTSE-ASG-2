@@ -9,7 +9,7 @@ import ctypes
 import re
 import os
 
-from chaser_logic import choose_chaser_evade, chaser_box_metrics
+from chaser_logic import choose_chaser_evade, chaser_box_metrics, choose_green_seek
 
 try:
     import pytesseract
@@ -72,6 +72,9 @@ CHASER_EVADE_LATCH_SEC = 0.6  # keep evading through 1-frame detection dropouts
 CHASER_CLOSE_PROXIMITY = 0.6  # >= this => escalate (never coast)
 EMERGENCY_TAP_HOLD_FRAMES = 7 # shorter hold so lane changes chain into a weave
 EMERGENCY_COOLDOWN_FRAMES = 2 # near-zero cooldown during chaser evasion
+GOLDEN_COMMIT_SEC = 2.5       # commit to golden lane for the final part of the
+                              # 5.5s OCR latch; wide enough to cover the real EV5
+                              # expiry despite OCR read lag (tune vs. EV5 hit rate)
 evade_dir = 1                 # current sweep direction (-1 left / +1 right)
 
 # Morphology Kernel
@@ -447,17 +450,10 @@ def detect_environment(front_frame):
 # ---------------------------------------------------------
 # Decision Making
 # ---------------------------------------------------------
-def evaluate_decision(detected_objects, current_lane, low_light_mode, chaser_behind, chaser_boxes, seek_red_mode, golden_mode, golden_target, chaser_proximity=0.0):
-    target_steer = 0.0
-    target_accel = 1.0
-    debug_text = "CRUISING"
-
-    # Low brightness event reaction
-    if low_light_mode and not chaser_behind:
-        return 0.0, -1.0, "LOW LIGHT: BRAKING TO RECOVER"
+def evaluate_decision(detected_objects, current_lane, low_light_mode, chaser_behind, chaser_boxes, seek_red_mode, golden_time_left, golden_target, chaser_proximity=0.0):
+    global evade_dir
 
     police_lanes, danger_lanes, red_lanes, green_lanes = set(), set(), set(), set()
-
     for obj in detected_objects:
         for lane in obj['lanes']:
             if current_lane + lane < -2 or current_lane + lane > 2: continue
@@ -465,21 +461,20 @@ def evaluate_decision(detected_objects, current_lane, low_light_mode, chaser_beh
                 if obj.get('subtype') == 'POLICE': police_lanes.add(lane)
                 elif obj.get('subtype') == 'RED':
                     red_lanes.add(lane)
-                    if not seek_red_mode: danger_lanes.add(lane) 
+                    if not seek_red_mode: danger_lanes.add(lane)
                 else: danger_lanes.add(lane)
             elif obj['type'] == 'GREEN': green_lanes.add(lane)
 
-    if police_lanes: target_accel = 0.75
+    # --- Longitudinal channel (accel), decoupled from steering ---
+    if low_light_mode: target_accel = -1.0       # EV1: full brake
+    elif police_lanes: target_accel = 0.75       # ease off near the police car
+    else: target_accel = 1.0
 
-    # Golden lane event reaction
-    if golden_mode and 1 <= golden_target <= 5:
-        rel_golden = golden_target - (current_lane + 3)
-        
-        if rel_golden not in police_lanes:
-            if rel_golden < 0: return -1.0, target_accel, f"EV5: SEEKING L{golden_target} <<"
-            elif rel_golden > 0: return 1.0, target_accel, f"EV5: SEEKING L{golden_target} >>"
-            else: return 0.0, target_accel, f"HOLDING AT LANE {golden_target}"
+    golden_mode = (golden_time_left > 0) and (1 <= golden_target <= 5)
+    rel_golden = (golden_target - (current_lane + 3)) if golden_mode else 0
+    chaser_imminent = chaser_behind and chaser_proximity >= CHASER_CLOSE_PROXIMITY
 
+    # --- P0: never hit the police car (instant game over) ---
     if 0 in police_lanes:
         if -1 not in police_lanes and -1 not in danger_lanes and current_lane > -2: return -1.0, target_accel, "<< EVADE POLICE LEFT"
         elif 1 not in police_lanes and 1 not in danger_lanes and current_lane < 2: return 1.0, target_accel, "EVADE POLICE RIGHT >>"
@@ -487,45 +482,57 @@ def evaluate_decision(detected_objects, current_lane, low_light_mode, chaser_beh
         elif current_lane < 2: return 1.0, target_accel, "EVADE POLICE RIGHT (RISK) >>"
         else: return 0.0, 0.5, "TRAPPED BY POLICE"
 
-    # EV2: collect a red token. Runs AHEAD of the chaser weave unless the
-    # chaser is close enough to hit us -- collecting one red ends EV2 fast and
-    # EV2 is pass/fail for the Tactical win.
-    chaser_imminent = chaser_behind and chaser_proximity >= CHASER_CLOSE_PROXIMITY
+    # --- P1: golden LATE-COMMIT (final approach -- EV5 only scores the lane at expiry) ---
+    if golden_mode and golden_time_left <= GOLDEN_COMMIT_SEC and rel_golden not in police_lanes:
+        if rel_golden < 0: return -1.0, target_accel, f"EV5 COMMIT L{golden_target} <<"
+        elif rel_golden > 0: return 1.0, target_accel, f"EV5 COMMIT L{golden_target} >>"
+        else: return 0.0, target_accel, f"HOLDING LANE {golden_target}"
+
+    # --- P1: collect red (EV2), unless the chaser is about to hit us ---
     if seek_red_mode and red_lanes and not chaser_imminent:
         if 0 in red_lanes and 0 not in police_lanes: return 0.0, target_accel, "SEEKING RED AHEAD"
         elif -1 in red_lanes and -1 not in police_lanes and current_lane > -2: return -1.0, target_accel, "<< SEEKING RED LEFT"
         elif 1 in red_lanes and 1 not in police_lanes and current_lane < 2: return 1.0, target_accel, "SEEKING RED RIGHT >>"
 
+    # --- P1: chaser evade (sweep). accel stays braked in darkness => brake + weave ---
     if chaser_behind:
-        global evade_dir
-        target_accel = 1.0
-        # Police lanes are hard-blocked (game over); danger/red lanes are a
-        # last resort so the car escapes rather than freezing when boxed in.
+        # Police lanes are hard-blocked (game over); danger/red lanes are a last
+        # resort so the car escapes rather than freezing when boxed in.
         steer, evade_dir, text = choose_chaser_evade(current_lane, evade_dir, police_lanes, danger_lanes)
         return steer, target_accel, text
 
+    # --- P1: golden EARLY-SEEK (loose window; late-commit above handles the deadline) ---
+    if golden_mode and rel_golden not in police_lanes:
+        if rel_golden < 0: return -1.0, target_accel, f"EV5: SEEKING L{golden_target} <<"
+        elif rel_golden > 0: return 1.0, target_accel, f"EV5: SEEKING L{golden_target} >>"
+        else: return 0.0, target_accel, f"HOLDING AT LANE {golden_target}"
+
+    # --- Darkness with nothing else active: brake straight (perception unreliable) ---
+    if low_light_mode:
+        return 0.0, target_accel, "LOW LIGHT: BRAKING STRAIGHT"
+
+    # --- P2: evade danger (red/yellow), preferring a green-ward escape ---
     if 0 in danger_lanes:
         safe_left = (-1 not in danger_lanes) and (-1 not in police_lanes) and (current_lane > -2)
         safe_right = (1 not in danger_lanes) and (1 not in police_lanes) and (current_lane < 2)
-
         if safe_left and safe_right:
-            # Both sides are safe. Actively look for a reason to pick one over the other.
             if 1 in green_lanes: return 1.0, target_accel, "EVADE RIGHT (TO GREEN) >>"
             elif -1 in green_lanes: return -1.0, target_accel, "<< EVADE LEFT (TO GREEN)"
-            else: return -1.0, target_accel, "<< EVADE LEFT (DEFAULT)" 
+            else: return -1.0, target_accel, "<< EVADE LEFT (DEFAULT)"
         elif safe_left: return -1.0, target_accel, "<< EVADE LEFT"
         elif safe_right: return 1.0, target_accel, "EVADE RIGHT >>"
         else: return 0.0, 0.6, "TRAPPED BY DANGER"
 
-    if green_lanes:
-        if 0 in green_lanes: return 0.0, target_accel, "SEEK GREEN AHEAD"
-        elif -1 in green_lanes and -1 not in danger_lanes and -1 not in police_lanes and current_lane > -2: return -1.0, target_accel, "<< SEEK GREEN LEFT"
-        elif 1 in green_lanes and 1 not in danger_lanes and 1 not in police_lanes and current_lane < 2: return 1.0, target_accel, "SEEK GREEN RIGHT >>"
+    # --- P2: harvest green across all 5 lanes (toward nearest reachable green) ---
+    green_steer, green_label = choose_green_seek(current_lane, green_lanes, police_lanes | danger_lanes)
+    if green_steer is not None:
+        return green_steer, target_accel, green_label
 
+    # --- P2: auto-center ---
     if current_lane < 0 and 1 not in police_lanes and 1 not in danger_lanes: return 1.0, target_accel, "AUTO CENTER >>"
     elif current_lane > 0 and -1 not in police_lanes and -1 not in danger_lanes: return -1.0, target_accel, "<< AUTO CENTER"
-        
-    return target_steer, target_accel, debug_text
+
+    return 0.0, target_accel, "CRUISING"
 
 def processing_task():
     #This is where you write your image processing code to decide how to control the car
@@ -582,11 +589,11 @@ def processing_task():
             
             golden_lane_end = shared_data.get('golden_lane_end_time', 0.0)
             golden_lane_target = shared_data.get('golden_lane_target', 0)
-            golden_mode = time.time() < golden_lane_end
+            golden_time_left = golden_lane_end - time.time()
             proximity_for_decision = shared_data.get('chaser_proximity', 0.0)
 
         target_steer, target_accel, debug_text = evaluate_decision(
-            detected_objects, current_lane, low_light_mode, chaser_behind, chaser_boxes, seek_red_mode, golden_mode, golden_lane_target, proximity_for_decision
+            detected_objects, current_lane, low_light_mode, chaser_behind, chaser_boxes, seek_red_mode, golden_time_left, golden_lane_target, proximity_for_decision
         )
 
         with state_lock:

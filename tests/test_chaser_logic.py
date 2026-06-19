@@ -1,5 +1,5 @@
 import unittest
-from chaser_logic import choose_chaser_evade, chaser_box_metrics
+from chaser_logic import choose_chaser_evade, chaser_box_metrics, choose_green_seek
 
 
 class TestChooseChaserEvade(unittest.TestCase):
@@ -84,6 +84,37 @@ class TestChaserBoxMetrics(unittest.TestCase):
         _, proximity, _ = chaser_box_metrics(110, 240, 20, 10)
         self.assertLessEqual(proximity, 1.0)
         self.assertGreaterEqual(proximity, 0.1)
+
+
+class TestChooseGreenSeek(unittest.TestCase):
+    def test_no_green_returns_none(self):
+        steer, _ = choose_green_seek(0, set(), set())
+        self.assertIsNone(steer)
+
+    def test_green_ahead_holds(self):
+        steer, label = choose_green_seek(0, {0}, set())
+        self.assertEqual(steer, 0.0)
+        self.assertIn("AHEAD", label)
+
+    def test_green_ahead_but_blocked_falls_to_side(self):
+        # Green ahead (0) and at left (-1); lane 0 blocked -> go to the green at left.
+        steer, _ = choose_green_seek(0, {0, -1}, {0})
+        self.assertEqual(steer, -1.0)
+
+    def test_picks_nearest_green_side(self):
+        # Green 2 lanes left, 1 lane right -> right is nearer.
+        steer, _ = choose_green_seek(0, {-2, 1}, set())
+        self.assertEqual(steer, 1.0)
+
+    def test_avoids_blocked_side(self):
+        # Nearest green is right (+1) but it's blocked -> take the left green.
+        steer, _ = choose_green_seek(0, {-1, 1}, {1})
+        self.assertEqual(steer, -1.0)
+
+    def test_edge_blocks_movement(self):
+        # At right edge (+2); green only further right is unreachable -> None.
+        steer, _ = choose_green_seek(2, {1}, set())
+        self.assertIsNone(steer)
 
 
 if __name__ == "__main__":
