@@ -26,6 +26,8 @@ LANES_PER_ROAD = 5
 HORIZON_Y = 80                 # fallback horizon row (flat-road assumption)
 FALLBACK_LANE_SLOPE = 0.44     # lane width per unit depth, fixed model
 FALLBACK_ROAD_CENTER = 160.0   # frame center, fixed model
+CAR_CX = 160.0                 # the camera is car-centered: the car sits at frame x=160,
+                               # so object lanes are measured RELATIVE TO THE CAR here
 
 # A fit needs enough rows and vertical spread to extrapolate the horizon reliably.
 MIN_FIT_SAMPLES = 3
@@ -99,8 +101,11 @@ def occupied_lanes(cx, center_y, obj_w, road_model=None, roi_start_y=100):
     if lane_width <= 0:
         return []  # at/above the horizon there is no road plane to classify on
 
-    center = model.cx_slope * y + model.cx_intercept
-    rel_lane = int(round((cx - center) / lane_width))
+    # Classify RELATIVE TO THE CAR (frame center), not the road center: the camera
+    # is car-centered and the decision logic treats lane 0 as "ahead of the car".
+    # Using the road center mis-placed objects when the car was off-center and drove
+    # the bot into the police car. Width still comes from the measured road model.
+    rel_lane = int(round((cx - CAR_CX) / lane_width))
     lanes = {_clamp(rel_lane)}
     if obj_w > lane_width * 1.5:
         lanes.add(_clamp(rel_lane - 1))

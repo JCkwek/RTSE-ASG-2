@@ -23,17 +23,25 @@ class TestFallbackModel(unittest.TestCase):
         self.assertEqual(occupied_lanes(160, 80, 200), [-1, 0, 1])
 
 
-class TestModelFromBounds(unittest.TestCase):
-    """Single measured row: use the REAL center (slope-unaware width)."""
+class TestCarRelative(unittest.TestCase):
+    """Object lanes are relative to the CAR (frame center 160), not the road
+    center -- the camera is car-centered. The measured model supplies WIDTH only."""
 
-    def test_uses_measured_center_not_frame_center(self):
-        m = model_from_bounds((100, 300, 40, 85))  # center 200
-        self.assertEqual(occupied_lanes(200, 80, 10, m), [0])
+    def test_token_at_car_is_lane_zero_even_if_road_offcenter(self):
+        m = model_from_bounds((100, 300, 40, 85))  # road center measured at 200
+        self.assertEqual(occupied_lanes(160, 80, 10, m), [0])
 
-    def test_same_token_misclassified_without_model(self):
-        # The old hardcoded center (160) calls that same token lane +1 -- the
-        # "off-center lane recognized as the wrong lane" bug.
-        self.assertEqual(occupied_lanes(200, 80, 10, None), [1])
+    def test_token_at_road_center_is_not_lane_zero_when_car_offcenter(self):
+        # A token at the road center (200) is to the car's right, not lane 0.
+        m = model_from_bounds((100, 300, 40, 85))
+        self.assertNotEqual(occupied_lanes(200, 80, 10, m), [0])
+
+    def test_measured_width_still_used(self):
+        # Narrower measured road -> the same offset lands in a further-out lane.
+        wide = model_from_bounds((20, 300, 56, 85))    # wide lanes
+        narrow = model_from_bounds((120, 200, 16, 85))  # narrow lanes
+        self.assertLessEqual(occupied_lanes(210, 80, 10, wide)[0],
+                             occupied_lanes(210, 80, 10, narrow)[0])
 
     def test_none_bounds_returns_none(self):
         self.assertIsNone(model_from_bounds(None))
