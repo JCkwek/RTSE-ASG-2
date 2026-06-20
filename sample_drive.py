@@ -472,10 +472,11 @@ def evaluate_decision(detected_objects, current_lane, low_light_mode, chaser_beh
     if chaser_behind:
         for (cx, cy, cw, ch) in chaser_boxes:
             center_x = cx + cw / 2.0
-            if center_x < 130: chaser_lanes.add(-1)
-            elif center_x > 190: chaser_lanes.add(1)
+            if center_x < 140: chaser_lanes.add(-1)
+            elif center_x > 180: chaser_lanes.add(1)
             else: chaser_lanes.add(0)
-
+            for l in chaser_lanes:
+                danger_lanes.add(l)
     # Golden lane event reaction
     if golden_mode and 1 <= golden_target <= 5:
         rel_golden = golden_target - (current_lane + 3)
@@ -492,18 +493,30 @@ def evaluate_decision(detected_objects, current_lane, low_light_mode, chaser_beh
         elif current_lane < 2: return 1.0, target_accel, "EVADE POLICE RIGHT (RISK) >>"
         else: return 0.0, 0.5, "TRAPPED BY POLICE"
 
-    if chaser_behind and 0 in chaser_lanes:
+    if chaser_behind and (0 in chaser_lanes or -1 in chaser_lanes or 1 in chaser_lanes):
         target_accel = 1.0 
-        safe_lanes = [l for l in [-1, 0, 1] if l not in police_lanes and l not in danger_lanes and l not in chaser_lanes and -2 <= current_lane + l <= 2]
-        if safe_lanes: best_lane = min(safe_lanes, key=lambda l: abs(l))
+        safe_lanes = [l for l in [-2, -1, 1, 2] if l not in police_lanes and l not in danger_lanes and l not in chaser_lanes and -2 <= current_lane + l <= 2]
+        best_lane = 0
+        if safe_lanes:
+            safe_lanes.sort(key=lambda x: abs(x)) 
+            
+            if 1 in chaser_lanes: 
+                left_opts = [l for l in safe_lanes if l < 0]
+                best_lane = left_opts[0] if left_opts else safe_lanes[0]
+            elif -1 in chaser_lanes:
+                right_opts = [l for l in safe_lanes if l > 0]
+                best_lane = right_opts[0] if right_opts else safe_lanes[0]
+            else:
+                best_lane = safe_lanes[0]
         else:
-            semi_safe = [l for l in [-1, 0, 1] if l not in police_lanes and l not in chaser_lanes and -2 <= current_lane + l <= 2]
-            if semi_safe: best_lane = min(semi_safe, key=lambda l: abs(l))
-            else: best_lane = 0 
+            semi_safe = [l for l in [-2, -1, 1, 2] if l not in police_lanes and l not in chaser_lanes and -2 <= current_lane + l <= 2]
+            if semi_safe: 
+                semi_safe.sort(key=lambda x: abs(x))
+                best_lane = semi_safe[0]
         
         if best_lane < 0: return -1.0, target_accel, "<< DODGE CHASER LEFT"
         elif best_lane > 0: return 1.0, target_accel, "DODGE CHASER RIGHT >>"
-        else: return 0.0, target_accel, "CHASER IMMINENT! FLOOR IT!"
+        else: return 0.0, target_accel, "CHASER TRAPPED! BRACE!"
 
     if seek_red_mode and red_lanes:
         if 0 in red_lanes and 0 not in police_lanes: return 0.0, target_accel, "SEEKING RED AHEAD"
