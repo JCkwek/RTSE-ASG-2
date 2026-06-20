@@ -40,7 +40,7 @@ shared_data = {
     'debug_info': "WAITING",  
     'debug_tokens': [],        
     'net_lane_position': 0,
-    'lane_history': [0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 
+    'lane_history': [0, 0, 0, 0, 0, 0, 0, 0, 0, 0], # 10帧滤波器
     'road_bounds': None,   
     'low_light': False,
     'chaser_behind': False,
@@ -222,9 +222,10 @@ def ocr_task():
         with state_lock: shared_data['debug_golden_mask'] = mask.copy()
         
         if cv2.countNonZero(mask) > 15: 
-            mask_large = cv2.resize(mask, (0, 0), fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
+            # 优化：降低放大倍数和边缘填充，减少 Tesseract 运算负荷，大幅缓解延迟
+            mask_large = cv2.resize(mask, (0, 0), fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
             mask_inv = cv2.bitwise_not(mask_large)
-            mask_padded = cv2.copyMakeBorder(mask_inv, 20, 20, 20, 20, cv2.BORDER_CONSTANT, value=255)
+            mask_padded = cv2.copyMakeBorder(mask_inv, 10, 10, 10, 10, cv2.BORDER_CONSTANT, value=255)
             
             text = pytesseract.image_to_string(mask_padded, config='--psm 7').upper()
             
@@ -235,7 +236,7 @@ def ocr_task():
                 lane_num = int(match.group(1)) 
                 with state_lock:
                     shared_data['golden_lane_target'] = lane_num
-                    shared_data['golden_lane_end_time'] = time.time() + 5.5 
+                    shared_data['golden_lane_end_time'] = time.time() + 5
         else:
             with state_lock: shared_data['debug_ocr_text'] = ""
     except Exception: pass
@@ -333,9 +334,10 @@ def detect_environment(front_frame):
             cv2.drawContours(mask_curb_clean, [c], -1, 255, -1)
             
     h_roi, w_roi = roi_hsv.shape[:2]
+    lane_estimates = []
     best_road_bounds = None
     max_measured_gap = 0
-    
+
     for scan_y in [h_roi - 5, h_roi - 15, h_roi - 25]:
         row = mask_curb_clean[scan_y, :]
         curb_idx = np.where(row > 0)[0]
@@ -345,13 +347,24 @@ def detect_environment(front_frame):
         if len(diffs) > 0:
             max_gap_idx = np.argmax(diffs)
             max_gap = diffs[max_gap_idx]
+            
             if max_gap >= 80: 
                 x_left = curb_idx[max_gap_idx]
                 x_right = curb_idx[max_gap_idx + 1]
+                
+                road_center_x = (x_left + x_right) / 2.0
                 lane_w = max_gap / 5.0
+                offset_from_center = 160 - road_center_x
+                
+                lane_estimates.append(offset_from_center / lane_w)
+
                 if max_gap > max_measured_gap:
                     max_measured_gap = max_gap
                     best_road_bounds = (x_left, x_right, lane_w, scan_y)
+
+    visual_lane = None
+    if lane_estimates:
+        visual_lane = np.median(lane_estimates)
 
     mask_green = cv2.morphologyEx(mask_green, cv2.MORPH_OPEN, morph_kernel)
     mask_red = cv2.morphologyEx(mask_red, cv2.MORPH_OPEN, morph_kernel)
@@ -425,7 +438,8 @@ def detect_environment(front_frame):
                 if lanes:
                     detected_objects.append({'type': t_type, 'subtype': sub_type, 'lanes': lanes, 'dist': (y + h/2 + ROI_START_Y) - 80})
                     debug_tokens.append((sub_type, x, y, w, h))
-    return detected_objects, debug_tokens, low_light_mode, best_road_bounds
+
+    return detected_objects, debug_tokens, low_light_mode, visual_lane, best_road_bounds
 
 # ---------------------------------------------------------
 # Decision Making
@@ -452,7 +466,7 @@ def evaluate_decision(detected_objects, current_lane, low_light_mode, chaser_beh
                 else: danger_lanes.add(lane)
             elif obj['type'] == 'GREEN': green_lanes.add(lane)
 
-    if police_lanes: target_accel = 0.75
+    if police_lanes: target_accel = 0.5
 
     chaser_lanes = set()
     if chaser_behind:
@@ -539,9 +553,19 @@ def processing_task():
             
         chaser_boxes = detect_back_environment(back_frame)
         chaser_behind = len(chaser_boxes) > 0
-        detected_objects, debug_tokens, low_light_mode, road_bounds = detect_environment(front_frame)
+        detected_objects, debug_tokens, low_light_mode, visual_lane, road_bounds = detect_environment(front_frame)
         
         with state_lock:
+            if visual_lane is not None:
+                history = shared_data.get('lane_history', [0]*10)
+                history.append(visual_lane)
+                if len(history) > 10: history.pop(0)
+                shared_data['lane_history'] = history
+                
+                filtered_lane = np.median(history)
+                current_lane = max(-2, min(2, int(round(filtered_lane))))
+                shared_data['net_lane_position'] = current_lane
+            
             shared_data['road_bounds'] = road_bounds
 
         police_detected = any('POLICE' in t[0] for t in debug_tokens)
@@ -592,23 +616,22 @@ def send_controls_task():
         auto_steer = shared_data['steering_input']
         accel_input = shared_data['acceleration_input']
         is_emergency = shared_data.get('chaser_behind', False)
+        golden_active = time.time() < shared_data.get('golden_lane_end_time', 0.0)
 
     if tap_state == 'IDLE':
         if auto_steer != 0.0:
             active_steering_value = auto_steer
             tap_state = 'TAPPING'
-            tap_timer = TAP_HOLD_FRAMES
-
-            with state_lock:
-                if auto_steer < -0.1: shared_data['net_lane_position'] = max(-2, shared_data.get('net_lane_position', 0) - 1)
-                elif auto_steer > 0.1: shared_data['net_lane_position'] = min(2, shared_data.get('net_lane_position', 0) + 1)
+            tap_timer = 35 if golden_active else TAP_HOLD_FRAMES
         else: active_steering_value = 0.0
     elif tap_state == 'TAPPING':
-        if tap_timer > 0: tap_timer -= 1
+        if tap_timer > 0: 
+            tap_timer -= 1
+            if golden_active: active_steering_value = auto_steer
         else:
             active_steering_value = 0.0
             tap_state = 'COOLDOWN'
-            tap_timer = 2 if is_emergency else COOLDOWN_FRAMES
+            tap_timer = 2 if (is_emergency or golden_active) else COOLDOWN_FRAMES
     elif tap_state == 'COOLDOWN':
         active_steering_value = 0.0
         if tap_timer > 0: tap_timer -= 1
