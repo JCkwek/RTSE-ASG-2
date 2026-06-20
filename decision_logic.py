@@ -15,6 +15,7 @@ from chaser_logic import choose_chaser_evade, choose_green_seek, LANE_MIN, LANE_
 DEFAULT_CHASER_CLOSE_PROXIMITY = 0.6
 DEFAULT_MAX_RED_TOKEN_AREA = 130
 DEFAULT_GOLDEN_COMMIT_SEC = 2.5
+DEFAULT_DANGER_EASE_ACCEL = 0.8   # cap on accel while dodging a red ahead (buys dodge time)
 
 
 def evaluate_decision(detected_objects, current_lane, low_light_mode, chaser_behind,
@@ -22,7 +23,8 @@ def evaluate_decision(detected_objects, current_lane, low_light_mode, chaser_beh
                       chaser_proximity=0.0,
                       chaser_close_proximity=DEFAULT_CHASER_CLOSE_PROXIMITY,
                       max_red_token_area=DEFAULT_MAX_RED_TOKEN_AREA,
-                      golden_commit_sec=DEFAULT_GOLDEN_COMMIT_SEC):
+                      golden_commit_sec=DEFAULT_GOLDEN_COMMIT_SEC,
+                      danger_ease_accel=DEFAULT_DANGER_EASE_ACCEL):
     """Pick (steer, accel, label, new_evade_dir) from the perception state.
 
     Steering follows a fixed P0>P1>P2 priority cascade; acceleration is a
@@ -122,20 +124,24 @@ def evaluate_decision(detected_objects, current_lane, low_light_mode, chaser_beh
         return 0.0, target_accel, "LOW LIGHT: BRAKING STRAIGHT", new_evade_dir
 
     # --- P2: evade danger (red only -- yellow is neutral), preferring a green-ward escape ---
+    # Reds are the dominant net-green drag, so ease off the throttle while dodging one
+    # to buy frames to complete the lane change (Tactical > distance pays for it). A
+    # stronger longitudinal need still wins: darkness brake / police ease are kept.
     if 0 in danger_lanes:
+        danger_accel = min(target_accel, danger_ease_accel)
         safe_left = (-1 not in danger_lanes) and (-1 not in police_lanes) and (current_lane > LANE_MIN)
         safe_right = (1 not in danger_lanes) and (1 not in police_lanes) and (current_lane < LANE_MAX)
         if safe_left and safe_right:
             if 1 in green_lanes:
-                return 1.0, target_accel, "EVADE RIGHT (TO GREEN) >>", new_evade_dir
+                return 1.0, danger_accel, "EVADE RIGHT (TO GREEN) >>", new_evade_dir
             elif -1 in green_lanes:
-                return -1.0, target_accel, "<< EVADE LEFT (TO GREEN)", new_evade_dir
+                return -1.0, danger_accel, "<< EVADE LEFT (TO GREEN)", new_evade_dir
             else:
-                return -1.0, target_accel, "<< EVADE LEFT (DEFAULT)", new_evade_dir
+                return -1.0, danger_accel, "<< EVADE LEFT (DEFAULT)", new_evade_dir
         elif safe_left:
-            return -1.0, target_accel, "<< EVADE LEFT", new_evade_dir
+            return -1.0, danger_accel, "<< EVADE LEFT", new_evade_dir
         elif safe_right:
-            return 1.0, target_accel, "EVADE RIGHT >>", new_evade_dir
+            return 1.0, danger_accel, "EVADE RIGHT >>", new_evade_dir
         else:
             return 0.0, 0.6, "TRAPPED BY DANGER", new_evade_dir
 

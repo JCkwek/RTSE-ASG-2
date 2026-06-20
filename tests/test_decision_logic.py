@@ -134,5 +134,29 @@ class TestHarvestAndEvade(unittest.TestCase):
         self.assertEqual(new_dir, -1)
 
 
+class TestRedDodge(unittest.TestCase):
+    """Reds are the net-green drag -> ease the throttle while dodging one."""
+
+    def test_eases_throttle_dodging_red(self):
+        steer, accel, _, _ = decide(objects=[red(0)], current_lane=0)
+        self.assertEqual(accel, 0.8)
+        self.assertNotEqual(steer, 0.0)
+
+    def test_red_dodge_keeps_police_easeoff(self):
+        # Police to the side keeps the 0.75 ease (min with 0.8) while dodging the red.
+        _, accel, _, _ = decide(objects=[police(1), red(0)], current_lane=0)
+        self.assertEqual(accel, 0.75)
+
+    def test_trapped_by_red_unchanged(self):
+        steer, accel, label, _ = decide(objects=[red(-1), red(0), red(1)], current_lane=0)
+        self.assertEqual((steer, accel), (0.0, 0.6))
+        self.assertIn("TRAPPED", label)
+
+    def test_idle_green_seek_still_floors(self):
+        # No red ahead -> no ease; harvesting still runs at full throttle.
+        _, accel, _, _ = decide(objects=[green(1)], current_lane=0)
+        self.assertEqual(accel, 1.0)
+
+
 if __name__ == "__main__":
     unittest.main()

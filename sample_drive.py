@@ -86,6 +86,12 @@ MAX_RED_TOKEN_AREA = 130      # reds bigger than this are treated as the police
                               # Lower if police still gets hit; raise if real red
                               # tokens stop being collected (EV2). Read live sizes
                               # off the "RED:<area>" overlay labels to tune.
+RED_MIN_HEIGHT_FACTOR = 0.10  # reds detected at this height/y ratio (vs 0.15 for
+                              # green) so the bot starts dodging them EARLIER --
+                              # reds cap net green, the Tactical win condition.
+                              # Lower = detect farther (more dodge time, more noise).
+DANGER_EASE_ACCEL = 0.8       # throttle cap while dodging a red ahead, to buy frames
+                              # to complete the lane change (Tactical > distance).
 evade_dir = 1                 # current sweep direction (-1 left / +1 right)
 
 # Morphology Kernel
@@ -321,11 +327,11 @@ def detect_back_environment(back_frame):
     final_box, proximity, side = chaser_box_metrics(x, y, w, h)
     return [final_box], proximity, side
 
-def is_valid_3d_token(x, y, w, h, area):
+def is_valid_3d_token(x, y, w, h, area, min_height_factor=0.15):
     if area < 5: return False
     aspect_ratio = float(w) / h if h > 0 else 0
     if not (0.1 <= aspect_ratio <= 2.5): return False
-    min_required_height = max(5, y * 0.15) 
+    min_required_height = max(5, y * min_height_factor)
     if h < min_required_height: return False
     return True
 
@@ -450,7 +456,9 @@ def detect_environment(front_frame):
         cx, cy = x + w/2, y + h/2
         if any(px <= cx <= px+pw and py <= cy <= py+ph for (px, py, pw, ph) in police_car_zones): continue
         area = red_areas[(x, y, w, h)]
-        if is_valid_3d_token(x, y, w, h, area):
+        # Reds register at a smaller (farther) size than greens so the bot starts
+        # dodging earlier -- reds are the dominant net-green drag (Tactical blocker).
+        if is_valid_3d_token(x, y, w, h, area, RED_MIN_HEIGHT_FACTOR):
             lanes = get_occupied_lanes(x, y, w, h, road_model)
             if lanes:
                 detected_objects.append({'type': 'DANGER', 'subtype': 'RED', 'lanes': lanes, 'dist': (y + h/2 + ROI_START_Y) - 80, 'area': area})
@@ -553,6 +561,7 @@ def processing_task():
             chaser_close_proximity=CHASER_CLOSE_PROXIMITY,
             max_red_token_area=MAX_RED_TOKEN_AREA,
             golden_commit_sec=GOLDEN_COMMIT_SEC,
+            danger_ease_accel=DANGER_EASE_ACCEL,
         )
 
         with state_lock:
