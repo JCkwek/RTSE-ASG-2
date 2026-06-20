@@ -10,7 +10,8 @@ import os
 
 from chaser_logic import chaser_box_metrics
 from decision_logic import evaluate_decision
-from lane_geometry import occupied_lanes, fit_road_model, model_from_bounds
+from lane_geometry import occupied_lanes
+from road_trace import trace_road, occupied_lanes_from_profile, car_lane_from_profile
 from ocr_parsing import parse_lane
 
 try:
@@ -44,8 +45,9 @@ shared_data = {
     'debug_info': "WAITING",  
     'debug_tokens': [],        
     'net_lane_position': 0,
-    'lane_history': [0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 
-    'road_bounds': None,   
+    'lane_history': [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    'road_bounds': None,
+    'road_profile': None,
     'low_light': False,
     'chaser_behind': False,
     'chaser_boxes': [],
@@ -294,11 +296,24 @@ def ocr_task():
 # ---------------------------------------------------------
 ROI_START_Y = 100
 
-def get_occupied_lanes(x, y, w, h, road_model=None):
-    # Classify against the fitted road model (floating horizon) when available so
-    # decisions match the real road through slopes; falls back to a fixed model
-    # when no curbs are seen. Pure math lives in lane_geometry (unit-tested).
-    return occupied_lanes(x + w/2.0, y + h/2.0, w, road_model, ROI_START_Y)
+# --- Road-trace tunables (bottom-anchored sliding-window curb trace) ---
+TRACE_SCAN_STEP = 3             # rows between curb scans (smaller = finer trace, more CPU)
+TRACE_MIN_GAP = 70              # min road width (px) to anchor / keep tracing
+TRACE_WINDOW = 28               # max px a curb may shift per scanned row (turn tracking)
+LANE_CORRECT_ENABLED = True     # set False to fall back to pure tap dead-reckoning
+LANE_CORRECT_STABLE_FRAMES = 5  # frames the measured car-lane must agree before correcting
+                                # net_lane_position (filters tap-change lag, prevents fighting)
+
+def get_occupied_lanes(x, y, w, h, road_profile=None):
+    # Classify against the per-row road trace (follows turns + hills) when one was
+    # traced this frame; falls back to the fixed perspective model otherwise. Pure
+    # math lives in road_trace / lane_geometry (unit-tested).
+    cx, cy = x + w/2.0, y + h/2.0
+    if road_profile:
+        lanes = occupied_lanes_from_profile(road_profile, cx, cy + ROI_START_Y, w)
+        if lanes:
+            return lanes
+    return occupied_lanes(cx, cy, w, None, ROI_START_Y)
 
 def detect_back_environment(back_frame):
     if back_frame is None: return [], 0.0, 0
@@ -373,34 +388,23 @@ def detect_environment(front_frame):
             cv2.drawContours(mask_curb_clean, [c], -1, 255, -1)
             
     h_roi, w_roi = roi_hsv.shape[:2]
+
+    # Bottom-anchored sliding-window trace: anchor on the road the car sits in at
+    # the bottom (most reliable), then follow the curbs upward row by row. This
+    # bends with turns and stops at hill crests -- no fixed horizon, no straight-
+    # line assumption. (See road_trace; the pure trace is unit-tested.)
+    scan_order = list(range(h_roi - 2, 2, -TRACE_SCAN_STEP))
+    rows_curbs = {sy + ROI_START_Y: np.where(mask_curb_clean[sy, :] > 0)[0]
+                  for sy in scan_order}
+    scan_order_ff = [sy + ROI_START_Y for sy in scan_order]
+    road_profile = trace_road(rows_curbs, scan_order_ff, w_roi,
+                              min_gap=TRACE_MIN_GAP, window=TRACE_WINDOW)
+
+    # Bottom of the profile (nearest the car) drives the legacy display grid.
     best_road_bounds = None
-    max_measured_gap = 0
-    road_samples = []  # (y_fullframe, center_x, road_width) per measured curb row
-
-    # Scan many rows across the ROI (not just the bottom few) so the road model
-    # can FIT where the curbs converge -- a horizon that floats with the camera
-    # pitch on slopes, instead of a fixed horizon that drifts out of position.
-    for scan_y in range(h_roi - 5, 5, -5):
-        row = mask_curb_clean[scan_y, :]
-        curb_idx = np.where(row > 0)[0]
-        curb_idx = np.concatenate(([0], curb_idx, [w_roi - 1]))
-
-        diffs = np.diff(curb_idx)
-        if len(diffs) == 0:
-            continue
-        max_gap_idx = np.argmax(diffs)
-        max_gap = int(diffs[max_gap_idx])
-        if max_gap < 80:
-            continue
-        x_left = int(curb_idx[max_gap_idx])
-        x_right = int(curb_idx[max_gap_idx + 1])
-        road_samples.append((scan_y + ROI_START_Y, (x_left + x_right) / 2.0, float(max_gap)))
-        if max_gap > max_measured_gap:
-            max_measured_gap = max_gap
-            best_road_bounds = (x_left, x_right, max_gap / 5.0, scan_y)
-
-    # Prefer the multi-row fit (slope-aware); else the single widest row; else fixed.
-    road_model = fit_road_model(road_samples) or model_from_bounds(best_road_bounds, ROI_START_Y)
+    if road_profile:
+        by, bc, bw = road_profile[0]
+        best_road_bounds = (int(bc - bw / 2), int(bc + bw / 2), bw / 5.0, int(by - ROI_START_Y))
 
     mask_green = cv2.morphologyEx(mask_green, cv2.MORPH_OPEN, morph_kernel)
     mask_red = cv2.morphologyEx(mask_red, cv2.MORPH_OPEN, morph_kernel)
@@ -446,7 +450,7 @@ def detect_environment(front_frame):
                     car_y, car_h = max(0, light_y - int(light_h * 0.2)), int(light_h * 4.0)
                     police_car_zones.append((car_x, car_y, car_w, car_h))
                     
-                    lanes = get_occupied_lanes(car_x, car_y, car_w, car_h, road_model)
+                    lanes = get_occupied_lanes(car_x, car_y, car_w, car_h, road_profile)
                     if lanes:
                         detected_objects.append({'type': 'DANGER', 'subtype': 'POLICE', 'lanes': lanes, 'dist': (car_y + car_h/2 + ROI_START_Y) - 80})
                         debug_tokens.append(('POLICE', car_x, car_y, car_w, car_h))
@@ -459,7 +463,7 @@ def detect_environment(front_frame):
         # Reds register at a smaller (farther) size than greens so the bot starts
         # dodging earlier -- reds are the dominant net-green drag (Tactical blocker).
         if is_valid_3d_token(x, y, w, h, area, RED_MIN_HEIGHT_FACTOR):
-            lanes = get_occupied_lanes(x, y, w, h, road_model)
+            lanes = get_occupied_lanes(x, y, w, h, road_profile)
             if lanes:
                 detected_objects.append({'type': 'DANGER', 'subtype': 'RED', 'lanes': lanes, 'dist': (y + h/2 + ROI_START_Y) - 80, 'area': area})
                 debug_tokens.append((f'RED:{int(area)}', x, y, w, h))
@@ -471,11 +475,11 @@ def detect_environment(front_frame):
         cx, cy = x + w/2, y + h/2
         if any(px <= cx <= px+pw and py <= cy <= py+ph for (px, py, pw, ph) in police_car_zones): continue
         if is_valid_3d_token(x, y, w, h, area):
-            lanes = get_occupied_lanes(x, y, w, h, road_model)
+            lanes = get_occupied_lanes(x, y, w, h, road_profile)
             if lanes:
                 detected_objects.append({'type': 'GREEN', 'subtype': 'GREEN', 'lanes': lanes, 'dist': (y + h/2 + ROI_START_Y) - 80})
                 debug_tokens.append(('GREEN', x, y, w, h))
-    return detected_objects, debug_tokens, low_light_mode, best_road_bounds
+    return detected_objects, debug_tokens, low_light_mode, best_road_bounds, road_profile
 
 # ---------------------------------------------------------
 # Decision Making
@@ -515,10 +519,29 @@ def processing_task():
                     # Fresh chaser: start the sweep AWAY from where it is.
                     evade_dir = -1 if chaser_side > 0 else 1
             chaser_behind = now < shared_data.get('chaser_evade_end_time', 0.0)
-        detected_objects, debug_tokens, low_light_mode, road_bounds = detect_environment(front_frame)
-        
+        detected_objects, debug_tokens, low_light_mode, road_bounds, road_profile = detect_environment(front_frame)
+
+        # Correct dead-reckoned lane drift with the camera-measured car lane (bottom
+        # anchor). Only snap when the measurement agrees with itself for a few frames,
+        # so a lane change in progress (camera lags the tap) does not fight the move.
+        measured_lane = car_lane_from_profile(road_profile)
         with state_lock:
             shared_data['road_bounds'] = road_bounds
+            shared_data['road_profile'] = road_profile
+            if measured_lane is None:
+                shared_data['measured_lane_count'] = 0
+            else:
+                if measured_lane == shared_data.get('measured_lane_last'):
+                    shared_data['measured_lane_count'] = shared_data.get('measured_lane_count', 0) + 1
+                else:
+                    shared_data['measured_lane_count'] = 1
+                shared_data['measured_lane_last'] = measured_lane
+                # Snap only when settled AND no lane change is mid-flight (tap IDLE),
+                # so camera lag during a tap never reverts the predicted move.
+                if (LANE_CORRECT_ENABLED and tap_state == 'IDLE'
+                        and shared_data['measured_lane_count'] >= LANE_CORRECT_STABLE_FRAMES
+                        and measured_lane != shared_data.get('net_lane_position', 0)):
+                    shared_data['net_lane_position'] = measured_lane
 
         police_detected = any('POLICE' in t[0] for t in debug_tokens)
         
@@ -677,6 +700,7 @@ if __name__ == '__main__':
                 
                 current_rel_lane = shared_data.get('net_lane_position', 0)
                 road_bounds = shared_data.get('road_bounds', None)
+                road_profile = shared_data.get('road_profile', None)
                 
                 golden_lane_target = shared_data.get('golden_lane_target', 0)
                 golden_lane_end = shared_data.get('golden_lane_end_time', 0.0)
@@ -718,6 +742,17 @@ if __name__ == '__main__':
                             
                     cv2.line(display_front, (320, draw_y - 40), (320, draw_y + 40), (0, 255, 0), 3)
                     cv2.putText(display_front, "CAR", (300, draw_y - 45), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
+                # Traced road profile (curbs orange, center cyan) -- should bend on
+                # turns and run short uphill / long downhill. "TRACE N rows" = length.
+                if road_profile and len(road_profile) >= 2:
+                    left_pts = np.array([[int((pc - pw/2) * 2), int(py * 2)] for py, pc, pw in road_profile], np.int32)
+                    right_pts = np.array([[int((pc + pw/2) * 2), int(py * 2)] for py, pc, pw in road_profile], np.int32)
+                    mid_pts = np.array([[int(pc * 2), int(py * 2)] for py, pc, pw in road_profile], np.int32)
+                    cv2.polylines(display_front, [left_pts], False, (255, 180, 0), 2)
+                    cv2.polylines(display_front, [right_pts], False, (255, 180, 0), 2)
+                    cv2.polylines(display_front, [mid_pts], False, (0, 255, 255), 1)
+                    cv2.putText(display_front, f"TRACE {len(road_profile)} rows", (10, 205), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 180, 0), 1)
 
                 time_left = seek_red_end - time.time()
                 if time_left > 0: 
