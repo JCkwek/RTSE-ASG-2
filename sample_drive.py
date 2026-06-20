@@ -300,7 +300,9 @@ ROI_START_Y = 100
 TRACE_SCAN_STEP = 3             # rows between curb scans (smaller = finer trace, more CPU)
 TRACE_MIN_GAP = 70              # min road width (px) to anchor / keep tracing
 TRACE_WINDOW = 28               # max px a curb may shift per scanned row (turn tracking)
-LANE_CORRECT_ENABLED = True     # set False to fall back to pure tap dead-reckoning
+LANE_CORRECT_ENABLED = False    # TEMP off: isolating early police-collision crashes
+                                # (it overwrites net_lane_position, which P0 evasion uses).
+                                # Re-enable once confirmed it is not snapping to wrong lanes.
 LANE_CORRECT_STABLE_FRAMES = 5  # frames the measured car-lane must agree before correcting
                                 # net_lane_position (filters tap-change lag, prevents fighting)
 
