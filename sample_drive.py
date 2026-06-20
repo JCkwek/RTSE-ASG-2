@@ -10,8 +10,8 @@ import os
 
 from chaser_logic import chaser_box_metrics
 from decision_logic import evaluate_decision
-from lane_geometry import occupied_lanes
-from road_trace import trace_road, occupied_lanes_from_profile, car_lane_from_profile
+from lane_geometry import occupied_lanes, fit_road_model, model_from_bounds
+from road_trace import trace_road, car_lane_from_profile
 from ocr_parsing import parse_lane
 
 try:
@@ -244,10 +244,13 @@ def read_back_camera_task(): read_single_camera(back_camera_sock, 'latest_back_f
 #    or not in this color: widen/move GOLDEN_CROP, or adjust GOLDEN_YELLOW_LO/HI.
 #  - If the mask shows the text but OCR EXTR is wrong/empty -> OCR problem (parsing
 #    is already tolerant via ocr_parsing.parse_lane).
-GOLDEN_CROP = (0.0, 0.30, 0.05, 0.95)   # (top, bottom, left, right) as frame fractions
-GOLDEN_YELLOW_LO = (15, 90, 90)         # HSV lower bound for the gold flash text
-GOLDEN_YELLOW_HI = (40, 255, 255)       # HSV upper bound
-GOLDEN_MIN_YELLOW_PX = 12               # min yellow pixels before running OCR
+# Flash observed: "LANE 4 - ALL GREEN! (3s)" in bright PALE gold at top-center.
+GOLDEN_CROP = (0.0, 0.26, 0.10, 0.90)   # (top, bottom, left, right) as frame fractions
+GOLDEN_YELLOW_LO = (12, 40, 120)        # HSV lower bound: low S catches pale gold,
+                                        # high V keeps it to bright text (excludes white
+                                        # clouds, which are near S=0).
+GOLDEN_YELLOW_HI = (45, 255, 255)       # HSV upper bound (hue widened to 45)
+GOLDEN_MIN_YELLOW_PX = 10               # min gold pixels before running OCR
 GOLDEN_LATCH_SEC = 5.5                  # latched lifetime of one detection (vs real 5s)
 
 def ocr_task():
@@ -306,16 +309,12 @@ LANE_CORRECT_ENABLED = False    # TEMP off: isolating early police-collision cra
 LANE_CORRECT_STABLE_FRAMES = 5  # frames the measured car-lane must agree before correcting
                                 # net_lane_position (filters tap-change lag, prevents fighting)
 
-def get_occupied_lanes(x, y, w, h, road_profile=None):
-    # Classify against the per-row road trace (follows turns + hills) when one was
-    # traced this frame; falls back to the fixed perspective model otherwise. Pure
-    # math lives in road_trace / lane_geometry (unit-tested).
-    cx, cy = x + w/2.0, y + h/2.0
-    if road_profile:
-        lanes = occupied_lanes_from_profile(road_profile, cx, cy + ROI_START_Y, w)
-        if lanes:
-            return lanes
-    return occupied_lanes(cx, cy, w, None, ROI_START_Y)
+def get_occupied_lanes(x, y, w, h, road_model=None):
+    # Classify against the floating-horizon LINEAR model fit from the road-trace
+    # points (stable extrapolation everywhere, incl. distant objects). The raw
+    # per-row trace is NOT used here yet -- it mis-placed distant objects (police
+    # car) and caused game-overs. Falls back to a fixed model when no road measured.
+    return occupied_lanes(x + w/2.0, y + h/2.0, w, road_model, ROI_START_Y)
 
 def detect_back_environment(back_frame):
     if back_frame is None: return [], 0.0, 0
@@ -408,6 +407,10 @@ def detect_environment(front_frame):
         by, bc, bw = road_profile[0]
         best_road_bounds = (int(bc - bw / 2), int(bc + bw / 2), bw / 5.0, int(by - ROI_START_Y))
 
+    # Decisions classify against a floating-horizon LINEAR model fit from the trace
+    # points -- the crash-free method. (The raw trace drives display + car-lane only.)
+    road_model = fit_road_model(road_profile) or model_from_bounds(best_road_bounds, ROI_START_Y)
+
     mask_green = cv2.morphologyEx(mask_green, cv2.MORPH_OPEN, morph_kernel)
     mask_red = cv2.morphologyEx(mask_red, cv2.MORPH_OPEN, morph_kernel)
     mask_blue = cv2.morphologyEx(mask_blue, cv2.MORPH_OPEN, morph_kernel)
@@ -452,7 +455,7 @@ def detect_environment(front_frame):
                     car_y, car_h = max(0, light_y - int(light_h * 0.2)), int(light_h * 4.0)
                     police_car_zones.append((car_x, car_y, car_w, car_h))
                     
-                    lanes = get_occupied_lanes(car_x, car_y, car_w, car_h, road_profile)
+                    lanes = get_occupied_lanes(car_x, car_y, car_w, car_h, road_model)
                     if lanes:
                         detected_objects.append({'type': 'DANGER', 'subtype': 'POLICE', 'lanes': lanes, 'dist': (car_y + car_h/2 + ROI_START_Y) - 80})
                         debug_tokens.append(('POLICE', car_x, car_y, car_w, car_h))
@@ -465,7 +468,7 @@ def detect_environment(front_frame):
         # Reds register at a smaller (farther) size than greens so the bot starts
         # dodging earlier -- reds are the dominant net-green drag (Tactical blocker).
         if is_valid_3d_token(x, y, w, h, area, RED_MIN_HEIGHT_FACTOR):
-            lanes = get_occupied_lanes(x, y, w, h, road_profile)
+            lanes = get_occupied_lanes(x, y, w, h, road_model)
             if lanes:
                 detected_objects.append({'type': 'DANGER', 'subtype': 'RED', 'lanes': lanes, 'dist': (y + h/2 + ROI_START_Y) - 80, 'area': area})
                 debug_tokens.append((f'RED:{int(area)}', x, y, w, h))
@@ -477,7 +480,7 @@ def detect_environment(front_frame):
         cx, cy = x + w/2, y + h/2
         if any(px <= cx <= px+pw and py <= cy <= py+ph for (px, py, pw, ph) in police_car_zones): continue
         if is_valid_3d_token(x, y, w, h, area):
-            lanes = get_occupied_lanes(x, y, w, h, road_profile)
+            lanes = get_occupied_lanes(x, y, w, h, road_model)
             if lanes:
                 detected_objects.append({'type': 'GREEN', 'subtype': 'GREEN', 'lanes': lanes, 'dist': (y + h/2 + ROI_START_Y) - 80})
                 debug_tokens.append(('GREEN', x, y, w, h))
